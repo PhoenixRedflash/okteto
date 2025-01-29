@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -43,14 +43,17 @@ func newJSONDisplayer(stdout, stderr io.Reader) *jsonDisplayer {
 		stderrScanner = bufio.NewScanner(stderr)
 	}
 
+	commandContext, cancel := context.WithCancel(context.Background())
+
 	return &jsonDisplayer{
-		stdoutScanner: stdoutScanner,
-		stderrScanner: stderrScanner,
+		stdoutScanner:  stdoutScanner,
+		stderrScanner:  stderrScanner,
+		commandContext: commandContext,
+		cancel:         cancel,
 	}
 }
 
 func (d *jsonDisplayer) Display(_ string) {
-	d.commandContext, d.cancel = context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wgDelta := 0
 	if d.stdoutScanner != nil {
@@ -83,7 +86,7 @@ func (d *jsonDisplayer) Display(_ string) {
 				case <-d.commandContext.Done():
 				default:
 					line := d.stderrScanner.Text()
-					oktetoLog.FWarning(os.Stdout, line)
+					oktetoLog.FPrintln(os.Stdout, line)
 					continue
 				}
 				break

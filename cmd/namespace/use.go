@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,7 +20,7 @@ import (
 	contextCMD "github.com/okteto/okteto/cmd/context"
 	"github.com/okteto/okteto/cmd/utils"
 	"github.com/okteto/okteto/pkg/analytics"
-	"github.com/okteto/okteto/pkg/errors"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/okteto"
 	"github.com/spf13/cobra"
@@ -30,7 +30,7 @@ const (
 	newNamespaceOption = "Create new namespace"
 )
 
-//UseOptions are the options for the use command
+// UseOptions are the options for the use command
 type UseOptions struct {
 	personal bool
 }
@@ -40,9 +40,9 @@ func Use(ctx context.Context) *cobra.Command {
 	options := &UseOptions{}
 	cmd := &cobra.Command{
 		Use:     "use [namespace]",
-		Short:   "Configure the current namespace of the okteto context",
+		Short:   "Configure the default namespace of the Okteto Context",
 		Aliases: []string{"ns"},
-		Args:    utils.MaximumNArgsAccepted(1, "https://okteto.com/docs/reference/cli/#use-1"),
+		Args:    utils.MaximumNArgsAccepted(1, "https://okteto.com/docs/reference/okteto-cli/#use-1"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			namespace := ""
 			if len(args) > 0 {
@@ -50,11 +50,11 @@ func Use(ctx context.Context) *cobra.Command {
 			}
 
 			if !okteto.IsOkteto() {
-				return errors.ErrContextIsNotOktetoCluster
+				return oktetoErrors.ErrContextIsNotOktetoCluster
 			}
 
 			if options.personal {
-				namespace = okteto.Context().PersonalNamespace
+				namespace = okteto.GetContext().PersonalNamespace
 			}
 
 			nsCmd, err := NewCommand()
@@ -67,12 +67,12 @@ func Use(ctx context.Context) *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().BoolVarP(&options.personal, "personal", "", false, "Load personal account")
+	cmd.Flags().BoolVarP(&options.personal, "personal", "", false, "Load personal namespace")
 
 	return cmd
 }
 
-func (nc *NamespaceCommand) Use(ctx context.Context, namespace string) error {
+func (nc *Command) Use(ctx context.Context, namespace string) error {
 	var err error
 	if namespace == "" {
 		namespace, err = nc.getNamespaceFromSelector(ctx)
@@ -83,28 +83,33 @@ func (nc *NamespaceCommand) Use(ctx context.Context, namespace string) error {
 
 	return nc.ctxCmd.Run(
 		ctx,
-		&contextCMD.ContextOptions{
-			Context:      okteto.Context().Name,
-			Namespace:    namespace,
-			Save:         true,
-			Show:         false,
-			IsCtxCommand: true,
+		&contextCMD.Options{
+			Context:              okteto.GetContext().Name,
+			Namespace:            namespace,
+			Save:                 true,
+			Show:                 false,
+			IsCtxCommand:         true,
+			CheckNamespaceAccess: true,
 		},
 	)
 
 }
 
-func (nc *NamespaceCommand) getNamespaceFromSelector(ctx context.Context) (string, error) {
+func (nc *Command) getNamespaceFromSelector(ctx context.Context) (string, error) {
 	namespaces, err := getNamespacesSelection(ctx)
 	if err != nil {
 		return "", err
 	}
-	ns, _, err := utils.AskForOptionsOkteto(ctx, namespaces, "Select the namespace you want to use:", "Namespace")
+	initialPosition := getInitialPosition(namespaces)
+	selector := utils.NewOktetoSelector("Select the namespace you want to use:", "Namespace")
+	ns, err := selector.AskForOptionsOkteto(namespaces, initialPosition)
 	if err != nil {
 		return "", err
 	}
 	if ns == newNamespaceOption {
-		ns = askForOktetoNamespace()
+		if ns, err = askForOktetoNamespace(); err != nil {
+			return "", err
+		}
 		createOptions := &CreateOptions{
 			Namespace: ns,
 			Show:      false,
@@ -123,7 +128,7 @@ func getNamespacesSelection(ctx context.Context) ([]utils.SelectorItem, error) {
 	}
 	spaces, err := oktetoClient.Namespaces().List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get namespaces: %s", err)
+		return nil, fmt.Errorf("failed to get namespaces: %w", err)
 	}
 
 	namespaces := []utils.SelectorItem{}
@@ -151,9 +156,23 @@ func getNamespacesSelection(ctx context.Context) ([]utils.SelectorItem, error) {
 	return namespaces, nil
 }
 
-func askForOktetoNamespace() string {
+func askForOktetoNamespace() (string, error) {
 	var namespace string
-	oktetoLog.Question("Enter the namespace you want to use: ")
-	fmt.Scanln(&namespace)
-	return namespace
+	if err := oktetoLog.Question("Enter the namespace you want to use: "); err != nil {
+		return "", err
+	}
+	if _, err := fmt.Scanln(&namespace); err != nil {
+		return "", err
+	}
+	return namespace, nil
+}
+
+func getInitialPosition(options []utils.SelectorItem) int {
+	currentNamespace := okteto.GetContext().Namespace
+	for indx, ns := range options {
+		if ns.Label == currentNamespace {
+			return indx
+		}
+	}
+	return -1
 }

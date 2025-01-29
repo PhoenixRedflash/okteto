@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,51 +15,96 @@ package up
 
 import (
 	"context"
+	"os/exec"
 	"time"
 
 	"github.com/moby/term"
-	"github.com/okteto/okteto/cmd/utils"
+	"github.com/okteto/okteto/pkg/analytics"
 	"github.com/okteto/okteto/pkg/k8s/apps"
 	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/model/forward"
+	"github.com/okteto/okteto/pkg/okteto"
 	"github.com/okteto/okteto/pkg/syncthing"
+	"github.com/okteto/okteto/pkg/types"
+	"github.com/spf13/afero"
 	apiv1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
+
+type registryInterface interface {
+	GetImageTagWithDigest(imageTag string) (string, error)
+	GetImageTag(image, service, namespace string) string
+	ExpandImage(image string) string
+}
+
+type builderInterface interface {
+	GetServicesToBuildDuringExecution(ctx context.Context, manifest *model.Manifest, svcToDeploy []string) ([]string, error)
+	Build(ctx context.Context, options *types.BuildOptions) error
+	GetSvcToBuildFromRegex(manifest *model.Manifest, imgFinder model.ImageFromManifest) (string, error)
+	GetBuildEnvVars() map[string]string
+}
+
+type analyticsTrackerInterface interface {
+	buildTrackerInterface
+	TrackDeploy(analytics.DeployMetadata)
+	TrackUp(*analytics.UpMetricsMetadata)
+}
+
+type buildTrackerInterface interface {
+	TrackImageBuild(ctx context.Context, meta *analytics.ImageBuildMetadata)
+}
+
+type deployTrackerInterface interface {
+	TrackDeploy(ctx context.Context, name, namespace string, success bool)
+}
+
+type buildDeployTrackerInterface interface {
+	buildTrackerInterface
+	deployTrackerInterface
+}
 
 // upContext is the common context of all operations performed during the up command
 type upContext struct {
-	Cancel            context.CancelFunc
-	ShutdownCompleted chan bool
-	Manifest          *model.Manifest
-	Dev               *model.Dev
-	Translations      map[string]*apps.Translation
-	isRetry           bool
-	Client            *kubernetes.Clientset
-	RestConfig        *rest.Config
-	Pod               *apiv1.Pod
-	Forwarder         forwarder
-	Disconnect        chan error
-	CommandResult     chan error
-	Exit              chan error
-	Sy                *syncthing.Syncthing
-	cleaned           chan string
-	hardTerminate     chan error
-	success           bool
-	resetSyncthing    bool
-	inFd              uintptr
-	isTerm            bool
-	stateTerm         *term.State
-	spinner           *utils.Spinner
-	StartTime         time.Time
-	Options           *UpOptions
+	Namespace             string
+	StartTime             time.Time
+	Forwarder             forwarder
+	tokenUpdater          tokenUpdater
+	builder               builderInterface
+	analyticsTracker      analyticsTrackerInterface
+	Fs                    afero.Fs
+	K8sClientProvider     okteto.K8sClientProvider
+	Registry              registryInterface
+	Disconnect            chan error
+	hybridCommand         *exec.Cmd
+	stateTerm             *term.State
+	CommandResult         chan error
+	Exit                  chan error
+	Sy                    *syncthing.Syncthing
+	cleaned               chan string
+	hardTerminate         chan error
+	Translations          map[string]*apps.Translation
+	Manifest              *model.Manifest
+	analyticsMeta         *analytics.UpMetricsMetadata
+	Dev                   *model.Dev
+	GlobalForwarderStatus chan error
+	ShutdownCompleted     chan bool
+	Options               *Options
+	Pod                   *apiv1.Pod
+	Cancel                context.CancelFunc
+	pidController         pidController
+	inFd                  uintptr
+	isRetry               bool
+	success               bool
+	resetSyncthing        bool
+	isTerm                bool
+	interruptReceived     bool
 }
 
 // Forwarder is an interface for the port-forwarding features
 type forwarder interface {
-	Add(model.Forward) error
+	Add(forward.Forward) error
 	AddReverse(model.Reverse) error
 	Start(string, string) error
+	StartGlobalForwarding() error
 	Stop()
-	TransformLabelsToServiceName(model.Forward) (model.Forward, error)
+	TransformLabelsToServiceName(forward.Forward) (forward.Forward, error)
 }

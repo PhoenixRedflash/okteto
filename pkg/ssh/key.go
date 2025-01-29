@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -10,12 +10,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 package ssh
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -23,28 +23,31 @@ import (
 	"path/filepath"
 
 	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/filesystem"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	"github.com/okteto/okteto/pkg/model"
 	"golang.org/x/crypto/ssh"
 )
 
 const (
-	privateKeyFile = "id_rsa_okteto"
-	publicKeyFile  = "id_rsa_okteto.pub"
-	bitSize        = 4096
+	privateKeyFile = "id_ecdsa_okteto"
+	publicKeyFile  = "id_ecdsa_okteto.pub"
+)
+
+var (
+	curve = elliptic.P256() // You can use P256(), P384(), or P521()
 )
 
 // KeyExists returns true if the okteto key pair exists
 func KeyExists() bool {
 	public, private := getKeyPaths()
-	if !model.FileExists(public) {
+	if !filesystem.FileExists(public) {
 		oktetoLog.Infof("%s doesn't exist", public)
 		return false
 	}
 
 	oktetoLog.Infof("%s already present", public)
 
-	if !model.FileExists(private) {
+	if !filesystem.FileExists(private) {
 		oktetoLog.Infof("%s doesn't exist", private)
 		return false
 	}
@@ -53,75 +56,74 @@ func KeyExists() bool {
 	return true
 }
 
-// GenerateKeys generates a SSH key pair on path
+// GenerateKeys generates an SSH key pair on path
 func GenerateKeys() error {
 	publicKeyPath, privateKeyPath := getKeyPaths()
-	return generateKeys(publicKeyPath, privateKeyPath, bitSize)
+	return generate(publicKeyPath, privateKeyPath)
 }
 
-func generateKeys(public, private string, bitSize int) error {
-	privateKey, err := generatePrivateKey(bitSize)
+func generate(public, private string) error {
+	privateKey, err := generatePrivateKey()
 	if err != nil {
-		return fmt.Errorf("failed to generate private SSH key: %s", err)
+		return fmt.Errorf("failed to generate private SSH key: %w", err)
 	}
 
 	publicKeyBytes, err := generatePublicKey(&privateKey.PublicKey)
 	if err != nil {
-		return fmt.Errorf("failed to generate public SSH key: %s", err)
+		return fmt.Errorf("failed to generate public SSH key: %w", err)
 	}
 
-	privateKeyBytes := encodePrivateKeyToPEM(privateKey)
+	privateKeyBytes, err := encodePrivateKeyToPEM(privateKey)
+	if err != nil {
+		return fmt.Errorf("failed to encode private SSH key: %w", err)
+	}
 
 	if err := os.WriteFile(public, publicKeyBytes, 0600); err != nil {
-		return fmt.Errorf("failed to write public SSH key: %s", err)
+		return fmt.Errorf("failed to write public SSH key: %w", err)
 	}
 
 	if err := os.WriteFile(private, privateKeyBytes, 0600); err != nil {
-		return fmt.Errorf("failed to write private SSH key: %s", err)
+		return fmt.Errorf("failed to write private SSH key: %w", err)
 	}
 
 	oktetoLog.Infof("created ssh keypair at  %s and %s", public, private)
 	return nil
 }
 
-func generatePrivateKey(bitSize int) (*rsa.PrivateKey, error) {
-	// Private Key generation
-	privateKey, err := rsa.GenerateKey(rand.Reader, bitSize)
+func generatePrivateKey() (*ecdsa.PrivateKey, error) {
+	// Generate ECDSA private key
+	privateKey, err := ecdsa.GenerateKey(curve, rand.Reader)
 	if err != nil {
 		return nil, err
 	}
-
-	// Validate Private Key
-	err = privateKey.Validate()
-	if err != nil {
-		return nil, err
-	}
-
 	return privateKey, nil
 }
 
-func encodePrivateKeyToPEM(privateKey *rsa.PrivateKey) []byte {
-	privDER := x509.MarshalPKCS1PrivateKey(privateKey)
-
-	privBlock := pem.Block{
-		Type:    "RSA PRIVATE KEY",
-		Headers: nil,
-		Bytes:   privDER,
+func encodePrivateKeyToPEM(privateKey *ecdsa.PrivateKey) ([]byte, error) {
+	// Marshal the private key to DER format
+	privDER, err := x509.MarshalECPrivateKey(privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal ECDSA private key: %w", err)
 	}
 
-	privatePEM := pem.EncodeToMemory(&privBlock)
+	// Create a PEM block
+	privBlock := pem.Block{
+		Type:  "EC PRIVATE KEY",
+		Bytes: privDER,
+	}
 
-	return privatePEM
+	// Encode the PEM block to memory
+	privatePEM := pem.EncodeToMemory(&privBlock)
+	return privatePEM, nil
 }
 
-func generatePublicKey(privatekey *rsa.PublicKey) ([]byte, error) {
-	publicRsaKey, err := ssh.NewPublicKey(privatekey)
+func generatePublicKey(privatekey *ecdsa.PublicKey) ([]byte, error) {
+	publicECDSAKey, err := ssh.NewPublicKey(privatekey)
 	if err != nil {
 		return nil, err
 	}
 
-	pubKeyBytes := ssh.MarshalAuthorizedKey(publicRsaKey)
-
+	pubKeyBytes := ssh.MarshalAuthorizedKey(publicECDSAKey)
 	return pubKeyBytes, nil
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -25,8 +25,8 @@ import (
 
 func Test_waitForDevPodsTermination(t *testing.T) {
 	var tests = []struct {
-		name string
 		dev  *model.Dev
+		name string
 	}{
 		{
 			name: "dev",
@@ -69,7 +69,7 @@ func Test_waitForDevPodsTermination(t *testing.T) {
 			dPod.ObjectMeta.SetDeletionTimestamp(&metav1.Time{})
 
 			client := fake.NewSimpleClientset(pod, dPod)
-			waitForDevPodsTermination(ctx, client, tt.dev, 5)
+			waitForDevPodsTermination(ctx, client, tt.dev, "ns", 5)
 		})
 	}
 

@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -26,11 +26,11 @@ import (
 )
 
 type forward struct {
+	pool          *pool
 	localAddress  string
 	remoteAddress string
-	c             bool
 	lock          sync.Mutex
-	pool          *pool
+	c             bool
 }
 
 func (f *forward) connected() bool {
@@ -87,15 +87,22 @@ func (f *forward) start(ctx context.Context) {
 }
 
 func (f *forward) handle(local net.Conn) {
-	defer local.Close()
+	defer func() {
+		if err := local.Close(); err != nil {
+			oktetoLog.Debugf("Error closing local connection: %s", err)
+		}
+	}()
 
 	remote, err := f.pool.get(f.remoteAddress)
 	if err != nil {
 		oktetoLog.Infof("%s -> failed to dial remote connection: %s", f.String(), err)
 		return
 	}
-
-	defer remote.Close()
+	defer func() {
+		if err := remote.Close(); err != nil {
+			oktetoLog.Debugf("Error closing remote connection: %s", err)
+		}
+	}()
 
 	quit := make(chan struct{}, 1)
 

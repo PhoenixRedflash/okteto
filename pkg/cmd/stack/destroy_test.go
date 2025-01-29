@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/okteto/okteto/cmd/utils"
+	"github.com/okteto/okteto/pkg/build"
 	"github.com/okteto/okteto/pkg/k8s/deployments"
 	"github.com/okteto/okteto/pkg/k8s/jobs"
 	"github.com/okteto/okteto/pkg/k8s/statefulsets"
@@ -36,14 +36,17 @@ func Test_destroyDeployments(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "ns",
-			Labels:    map[string]string{model.StackNameLabel: "stack-test"},
+			Labels: map[string]string{
+				model.StackNameLabel:        "stack-test",
+				model.StackServiceNameLabel: "test",
+			},
 		},
 	}
 
 	client := fake.NewSimpleClientset(dep)
 	var tests = []struct {
-		name                string
 		stack               *model.Stack
+		name                string
 		expectedDeployments int
 	}{
 		{
@@ -92,8 +95,7 @@ func Test_destroyDeployments(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			spinner := utils.NewSpinner("testing")
-			err := destroyDeployments(ctx, spinner, tt.stack, client)
+			err := destroyDeployments(ctx, tt.stack, client)
 			if err != nil {
 				t.Fatal("Not destroyed correctly")
 			}
@@ -115,14 +117,17 @@ func Test_destroyStatefulsets(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "ns",
-			Labels:    map[string]string{model.StackNameLabel: "stack-test"},
+			Labels: map[string]string{
+				model.StackNameLabel:        "stack-test",
+				model.StackServiceNameLabel: "test",
+			},
 		},
 	}
 
 	client := fake.NewSimpleClientset(sfs)
 	var tests = []struct {
-		name                string
 		stack               *model.Stack
+		name                string
 		expectedDeployments int
 	}{
 		{
@@ -134,7 +139,7 @@ func Test_destroyStatefulsets(t *testing.T) {
 					"test": {
 						Image:         "test_image",
 						RestartPolicy: corev1.RestartPolicyAlways,
-						Volumes: []model.StackVolume{
+						Volumes: []build.VolumeMounts{
 							{
 								LocalPath:  "/",
 								RemotePath: "/",
@@ -154,7 +159,7 @@ func Test_destroyStatefulsets(t *testing.T) {
 					"test-2": {
 						Image:         "test_image",
 						RestartPolicy: corev1.RestartPolicyAlways,
-						Volumes: []model.StackVolume{
+						Volumes: []build.VolumeMounts{
 							{
 								LocalPath:  "/",
 								RemotePath: "/",
@@ -183,8 +188,7 @@ func Test_destroyStatefulsets(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			spinner := utils.NewSpinner("testing")
-			err := destroyStatefulsets(ctx, spinner, tt.stack, client)
+			err := destroyStatefulsets(ctx, tt.stack, client)
 			if err != nil {
 				t.Fatal("Not destroyed correctly")
 			}
@@ -206,14 +210,17 @@ func Test_destroyJobs(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "ns",
-			Labels:    map[string]string{model.StackNameLabel: "stack-test"},
+			Labels: map[string]string{
+				model.StackNameLabel:        "stack-test",
+				model.StackServiceNameLabel: "test",
+			},
 		},
 	}
 
 	client := fake.NewSimpleClientset(job)
 	var tests = []struct {
-		name                string
 		stack               *model.Stack
+		name                string
 		expectedDeployments int
 	}{
 		{
@@ -262,8 +269,7 @@ func Test_destroyJobs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			spinner := utils.NewSpinner("testing")
-			err := destroyJobs(ctx, spinner, tt.stack, client)
+			err := destroyJobs(ctx, tt.stack, client)
 			if err != nil {
 				t.Fatal("Not destroyed correctly")
 			}

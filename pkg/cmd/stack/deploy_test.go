@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,24 +15,32 @@ package stack
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
 
-	"github.com/okteto/okteto/cmd/utils"
+	"github.com/okteto/okteto/pkg/build"
+	"github.com/okteto/okteto/pkg/divert"
+	"github.com/okteto/okteto/pkg/format"
+	"github.com/okteto/okteto/pkg/k8s/ingresses"
+	"github.com/okteto/okteto/pkg/k8s/services"
 	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
+	apiv1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestMain(m *testing.M) {
-	okteto.CurrentStore = &okteto.OktetoContextStore{
+	okteto.CurrentStore = &okteto.ContextStore{
 		CurrentContext: "test",
-		Contexts: map[string]*okteto.OktetoContext{
+		Contexts: map[string]*okteto.Context{
 			"test": {
 				Name:      "test",
 				Namespace: "namespace",
@@ -60,7 +68,7 @@ func Test_deploySvc(t *testing.T) {
 				Services: map[string]*model.Service{
 					"test": {
 						Image:         "test_image",
-						RestartPolicy: corev1.RestartPolicyAlways,
+						RestartPolicy: apiv1.RestartPolicyAlways,
 					},
 				},
 			},
@@ -74,8 +82,8 @@ func Test_deploySvc(t *testing.T) {
 				Services: map[string]*model.Service{
 					"test": {
 						Image:         "test_image",
-						RestartPolicy: corev1.RestartPolicyAlways,
-						Volumes: []model.StackVolume{
+						RestartPolicy: apiv1.RestartPolicyAlways,
+						Volumes: []build.VolumeMounts{
 							{
 								LocalPath:  "a",
 								RemotePath: "b",
@@ -97,17 +105,17 @@ func Test_deploySvc(t *testing.T) {
 				Services: map[string]*model.Service{
 					"test": {
 						Image:         "test_image",
-						RestartPolicy: corev1.RestartPolicyNever,
+						RestartPolicy: apiv1.RestartPolicyNever,
 					},
 				},
 			},
 		},
 	}
 
+	divertDriver := divert.NewNoop()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			spinner := utils.NewSpinner("testing")
-			err := deploySvc(ctx, tt.stack, tt.svcName, client, spinner)
+			err := deploySvc(ctx, tt.stack, tt.svcName, client, divertDriver)
 			if err != nil {
 				t.Fatal("Not deployed correctly")
 			}
@@ -115,6 +123,152 @@ func Test_deploySvc(t *testing.T) {
 	}
 }
 
+func Test_reDeploySvc(t *testing.T) {
+	ctx := context.Background()
+	oldJobSucceeded := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name:      "serviceName",
+		Namespace: "test",
+		Labels: map[string]string{
+			model.StackNameLabel:  "okteto",
+			model.DeployedByLabel: "okteto",
+		},
+	},
+		Status: batchv1.JobStatus{
+			Succeeded: 1,
+		},
+	}
+	oldSfs := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name:      "serviceName",
+		Namespace: "test",
+		Labels: map[string]string{
+			model.StackNameLabel:  "okteto",
+			model.DeployedByLabel: "okteto",
+		},
+	},
+		Status: appsv1.StatefulSetStatus{
+			ReadyReplicas: 1,
+		},
+	}
+	oldDep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      "serviceName",
+		Namespace: "test",
+		Labels: map[string]string{
+			model.StackNameLabel:  "okteto",
+			model.DeployedByLabel: "okteto",
+		},
+	},
+		Status: appsv1.DeploymentStatus{
+			ReadyReplicas: 1,
+		},
+	}
+	fakeClient := fake.NewSimpleClientset(oldJobSucceeded, oldSfs, oldDep)
+	var tests = []struct {
+		name      string
+		component string
+		stack     *model.Stack
+		svcName   string
+	}{
+		{
+			name:      "redeploy deployment",
+			component: "deployment",
+			svcName:   "serviceName",
+			stack: &model.Stack{
+				Namespace: "test",
+				Name:      "testName",
+				Services: map[string]*model.Service{
+					"serviceName": {
+						Image:         "test_image",
+						RestartPolicy: apiv1.RestartPolicyAlways,
+					},
+				},
+			},
+		},
+		{
+			name:      "redeploy sfs",
+			svcName:   "serviceName",
+			component: "sfs",
+			stack: &model.Stack{
+				Namespace: "test",
+				Name:      "testName",
+				Services: map[string]*model.Service{
+					"serviceName": {
+						Image:         "test_image",
+						RestartPolicy: apiv1.RestartPolicyAlways,
+						Volumes: []build.VolumeMounts{
+							{
+								LocalPath:  "a",
+								RemotePath: "b",
+							},
+						},
+					},
+				},
+				Volumes: map[string]*model.VolumeSpec{
+					"a": {},
+				},
+			},
+		},
+		{
+			name:      "redeploy job",
+			svcName:   "serviceName",
+			component: "job",
+			stack: &model.Stack{
+				Namespace: "test",
+				Name:      "testName",
+				Services: map[string]*model.Service{
+					"serviceName": {
+						Image:         "test_image",
+						RestartPolicy: apiv1.RestartPolicyNever,
+					},
+				},
+			},
+		},
+	}
+
+	divertDriver := divert.NewNoop()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := deploySvc(ctx, tt.stack, tt.svcName, fakeClient, divertDriver)
+			if err != nil {
+				t.Fatal("Not re-deployed correctly")
+			}
+
+			if tt.component == "deployment" {
+				d, err := fakeClient.AppsV1().Deployments(tt.stack.Namespace).Get(ctx, tt.svcName, metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if d.Labels[model.StackNameLabel] != format.ResourceK8sMetaString(tt.stack.Name) {
+					t.Fatal()
+				}
+				if d.Labels[model.DeployedByLabel] != format.ResourceK8sMetaString(tt.stack.Name) {
+					t.Fatal()
+				}
+			}
+			if tt.component == "sfs" {
+				sfs, err := fakeClient.AppsV1().StatefulSets(tt.stack.Namespace).Get(ctx, tt.svcName, metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sfs.Labels[model.StackNameLabel] != format.ResourceK8sMetaString(tt.stack.Name) {
+					t.Fatal()
+				}
+				if sfs.Labels[model.DeployedByLabel] != format.ResourceK8sMetaString(tt.stack.Name) {
+					t.Fatal()
+				}
+
+			}
+			if tt.component == "job" {
+				job, err := fakeClient.BatchV1().Jobs(tt.stack.Namespace).Get(ctx, tt.svcName, metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if job.Labels[model.StackNameLabel] != format.ResourceK8sMetaString(tt.stack.Name) {
+					t.Fatal()
+				}
+			}
+		})
+	}
+}
 func Test_deployDeployment(t *testing.T) {
 	ctx := context.Background()
 	stack := &model.Stack{
@@ -123,15 +277,14 @@ func Test_deployDeployment(t *testing.T) {
 		Services: map[string]*model.Service{
 			"test": {
 				Image:         "test_image",
-				RestartPolicy: corev1.RestartPolicyAlways,
+				RestartPolicy: apiv1.RestartPolicyAlways,
 			},
 		},
 	}
 	client := fake.NewSimpleClientset()
 
-	spinner := utils.NewSpinner("Starting...")
-	spinner.Start()
-	_, err := deployDeployment(ctx, "test", stack, client, spinner)
+	divertDriver := divert.NewNoop()
+	_, err := deployDeployment(ctx, "test", stack, client, divertDriver)
 	if err != nil {
 		t.Fatal("Not deployed correctly")
 	}
@@ -150,8 +303,8 @@ func Test_deployVolumes(t *testing.T) {
 		Services: map[string]*model.Service{
 			"test": {
 				Image:         "test_image",
-				RestartPolicy: corev1.RestartPolicyAlways,
-				Volumes: []model.StackVolume{
+				RestartPolicy: apiv1.RestartPolicyAlways,
+				Volumes: []build.VolumeMounts{
 					{
 						LocalPath:  "a",
 						RemotePath: "b",
@@ -165,9 +318,7 @@ func Test_deployVolumes(t *testing.T) {
 	}
 	client := fake.NewSimpleClientset()
 
-	spinner := utils.NewSpinner("Starting...")
-	spinner.Start()
-	err := deployVolume(ctx, "a", stack, client, spinner)
+	err := deployVolume(ctx, "a", stack, client)
 	if err != nil {
 		t.Fatal("Not deployed correctly")
 	}
@@ -186,8 +337,8 @@ func Test_deploySfs(t *testing.T) {
 		Services: map[string]*model.Service{
 			"test": {
 				Image:         "test_image",
-				RestartPolicy: corev1.RestartPolicyAlways,
-				Volumes: []model.StackVolume{
+				RestartPolicy: apiv1.RestartPolicyAlways,
+				Volumes: []build.VolumeMounts{
 					{
 						LocalPath:  "a",
 						RemotePath: "b",
@@ -201,9 +352,8 @@ func Test_deploySfs(t *testing.T) {
 	}
 	client := fake.NewSimpleClientset()
 
-	spinner := utils.NewSpinner("Starting...")
-	spinner.Start()
-	_, err := deployStatefulSet(ctx, "test", stack, client, spinner)
+	divertDriver := divert.NewNoop()
+	_, err := deployStatefulSet(ctx, "test", stack, client, divertDriver)
 	if err != nil {
 		t.Fatal("Not deployed correctly")
 	}
@@ -222,15 +372,14 @@ func Test_deployJob(t *testing.T) {
 		Services: map[string]*model.Service{
 			"test": {
 				Image:         "test_image",
-				RestartPolicy: corev1.RestartPolicyNever,
+				RestartPolicy: apiv1.RestartPolicyNever,
 			},
 		},
 	}
 	client := fake.NewSimpleClientset()
 
-	spinner := utils.NewSpinner("Starting...")
-	spinner.Start()
-	_, err := deployJob(ctx, "test", stack, client, spinner)
+	divertDriver := divert.NewNoop()
+	_, err := deployJob(ctx, "test", stack, client, divertDriver)
 	if err != nil {
 		t.Fatal("Not deployed correctly")
 	}
@@ -278,7 +427,7 @@ func Test_ValidateDeploySomeServices(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateDefinedServices(tt.stack, tt.svcsToBeDeployed)
+			err := ValidateDefinedServices(tt.stack, tt.svcsToBeDeployed)
 			if err == nil && tt.expectedErr {
 				t.Fatal("Expected err but not thrown")
 			}
@@ -345,7 +494,7 @@ func Test_AddSomeServices(t *testing.T) {
 				Namespace: "default",
 				Services: map[string]*model.Service{
 					"job-not-running": {
-						RestartPolicy: corev1.RestartPolicyNever,
+						RestartPolicy: apiv1.RestartPolicyNever,
 					},
 					"app": {DependsOn: model.DependsOn{
 						"job-not-running": model.DependsOnConditionSpec{},
@@ -361,13 +510,13 @@ func Test_AddSomeServices(t *testing.T) {
 				Namespace: "default",
 				Services: map[string]*model.Service{
 					"sfs-not-running": {
-						Volumes: []model.StackVolume{
+						Volumes: []build.VolumeMounts{
 							{
 								LocalPath:  "/",
 								RemotePath: "/",
 							},
 						},
-						RestartPolicy: corev1.RestartPolicyAlways,
+						RestartPolicy: apiv1.RestartPolicyAlways,
 					},
 					"app": {DependsOn: model.DependsOn{
 						"sfs-not-running": model.DependsOnConditionSpec{},
@@ -383,7 +532,7 @@ func Test_AddSomeServices(t *testing.T) {
 				Namespace: "default",
 				Services: map[string]*model.Service{
 					"dep-not-running": {
-						RestartPolicy: corev1.RestartPolicyAlways,
+						RestartPolicy: apiv1.RestartPolicyAlways,
 					},
 					"app": {DependsOn: model.DependsOn{
 						"dep-not-running": model.DependsOnConditionSpec{},
@@ -399,7 +548,7 @@ func Test_AddSomeServices(t *testing.T) {
 				Namespace: "default",
 				Services: map[string]*model.Service{
 					"job-active": {
-						RestartPolicy: corev1.RestartPolicyNever,
+						RestartPolicy: apiv1.RestartPolicyNever,
 					},
 					"app": {DependsOn: model.DependsOn{
 						"job-active": model.DependsOnConditionSpec{},
@@ -415,7 +564,7 @@ func Test_AddSomeServices(t *testing.T) {
 				Namespace: "default",
 				Services: map[string]*model.Service{
 					"job-failed": {
-						RestartPolicy: corev1.RestartPolicyNever,
+						RestartPolicy: apiv1.RestartPolicyNever,
 					},
 					"app": {DependsOn: model.DependsOn{
 						"job-failed": model.DependsOnConditionSpec{},
@@ -431,7 +580,7 @@ func Test_AddSomeServices(t *testing.T) {
 				Namespace: "default",
 				Services: map[string]*model.Service{
 					"job-succeeded": {
-						RestartPolicy: corev1.RestartPolicyNever,
+						RestartPolicy: apiv1.RestartPolicyNever,
 					},
 					"app": {DependsOn: model.DependsOn{
 						"job-succeeded": model.DependsOnConditionSpec{},
@@ -447,13 +596,13 @@ func Test_AddSomeServices(t *testing.T) {
 				Namespace: "default",
 				Services: map[string]*model.Service{
 					"sfs": {
-						Volumes: []model.StackVolume{
+						Volumes: []build.VolumeMounts{
 							{
 								LocalPath:  "/",
 								RemotePath: "/",
 							},
 						},
-						RestartPolicy: corev1.RestartPolicyAlways,
+						RestartPolicy: apiv1.RestartPolicyAlways,
 					},
 					"app": {DependsOn: model.DependsOn{
 						"sfs": model.DependsOnConditionSpec{},
@@ -469,7 +618,7 @@ func Test_AddSomeServices(t *testing.T) {
 				Namespace: "default",
 				Services: map[string]*model.Service{
 					"dep": {
-						RestartPolicy: corev1.RestartPolicyAlways,
+						RestartPolicy: apiv1.RestartPolicyAlways,
 					},
 					"app": {DependsOn: model.DependsOn{
 						"dep": model.DependsOnConditionSpec{},
@@ -496,7 +645,7 @@ func Test_AddSomeServices(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			options := &StackDeployOptions{ServicesToDeploy: tt.svcsToBeDeployed}
+			options := &DeployOptions{ServicesToDeploy: tt.svcsToBeDeployed}
 			options.ServicesToDeploy = AddDependentServicesIfNotPresent(ctx, tt.stack, options.ServicesToDeploy, fakeClient)
 
 			if !reflect.DeepEqual(tt.expectedSvcsToBeDeployed, options.ServicesToDeploy) {
@@ -512,9 +661,9 @@ func Test_getVolumesToDeployFromServicesToDeploy(t *testing.T) {
 		servicesToDeploy map[string]bool
 	}
 	tests := []struct {
-		name     string
 		args     args
 		expected map[string]bool
+		name     string
 	}{
 		{
 			name: "should return volumes from services to deploy",
@@ -526,7 +675,7 @@ func Test_getVolumesToDeployFromServicesToDeploy(t *testing.T) {
 				stack: &model.Stack{
 					Services: map[string]*model.Service{
 						"service ab": {
-							Volumes: []model.StackVolume{
+							Volumes: []build.VolumeMounts{
 								{
 									LocalPath: "volume a",
 								},
@@ -536,14 +685,14 @@ func Test_getVolumesToDeployFromServicesToDeploy(t *testing.T) {
 							},
 						},
 						"service b": {
-							Volumes: []model.StackVolume{
+							Volumes: []build.VolumeMounts{
 								{
 									LocalPath: "volume b",
 								},
 							},
 						},
 						"service bc": {
-							Volumes: []model.StackVolume{
+							Volumes: []build.VolumeMounts{
 								{
 									LocalPath: "volume b",
 								},
@@ -584,9 +733,9 @@ func Test_getEndpointsToDeployFromServicesToDeploy(t *testing.T) {
 		servicesToDeploy map[string]bool
 	}
 	tests := []struct {
-		name     string
 		args     args
 		expected map[string]bool
+		name     string
 	}{
 		{
 			name: "multiple endpoints",
@@ -627,6 +776,288 @@ func Test_getEndpointsToDeployFromServicesToDeploy(t *testing.T) {
 			if !reflect.DeepEqual(resultSet, tt.expected) {
 				t.Errorf("expected %v, got %v", tt.expected, result)
 			}
+		})
+	}
+}
+
+func TestDeployK8sService(t *testing.T) {
+	tests := []struct {
+		stack             *model.Stack
+		name              string
+		expectedNameLabel string
+		k8sObjects        []runtime.Object
+	}{
+		{
+			name: "skip service",
+			k8sObjects: []runtime.Object{
+				&apiv1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test",
+						Namespace: "ns",
+						Labels: map[string]string{
+							model.StackNameLabel: "hola",
+						},
+					},
+				},
+			},
+			stack: &model.Stack{
+				Namespace: "ns",
+				Name:      "test",
+				Services: map[string]*model.Service{
+					"test": {
+						Labels: map[string]string{
+							"ey": "a",
+						},
+					},
+				},
+			},
+			expectedNameLabel: "hola",
+		},
+		{
+			name: "update service",
+			k8sObjects: []runtime.Object{
+				&apiv1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test",
+						Namespace: "ns",
+						Labels: map[string]string{
+							model.StackNameLabel: "test",
+						},
+					},
+				},
+			},
+			stack: &model.Stack{
+				Namespace: "ns",
+				Name:      "test",
+				Services: map[string]*model.Service{
+					"test": {
+						Labels: map[string]string{
+							"ey": "a",
+						},
+					},
+				},
+			},
+			expectedNameLabel: "test",
+		},
+		{
+			name:       "create new service",
+			k8sObjects: []runtime.Object{},
+			stack: &model.Stack{
+				Namespace: "ns",
+				Name:      "test",
+				Services: map[string]*model.Service{
+					"test": {
+						Labels: map[string]string{
+							"ey": "a",
+						},
+					},
+				},
+			},
+			expectedNameLabel: "test",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewSimpleClientset(tt.k8sObjects...)
+			err := deployK8sService(context.Background(), "test", tt.stack, fakeClient)
+			assert.NoError(t, err)
+			svc, err := services.Get(context.Background(), "test", "ns", fakeClient)
+			assert.NoError(t, err)
+			assert.Equal(t, svc.ObjectMeta.Labels[model.StackNameLabel], tt.expectedNameLabel)
+		})
+	}
+}
+
+func TestGetErrorDueToRestartLimit(t *testing.T) {
+	tests := []struct {
+		err        error
+		stack      *model.Stack
+		name       string
+		k8sObjects []runtime.Object
+	}{
+		{
+			name: "no dependent services",
+			stack: &model.Stack{
+				Services: map[string]*model.Service{
+					"test2": {
+						DependsOn: model.DependsOn{},
+					},
+				},
+			},
+			err: nil,
+		},
+		{
+			name: "dependent svc without reaching backoff",
+			k8sObjects: []runtime.Object{
+				&apiv1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							model.StackNameLabel:        "test",
+							model.StackServiceNameLabel: "test1",
+						},
+					},
+					Status: apiv1.PodStatus{
+						ContainerStatuses: []apiv1.ContainerStatus{
+							{
+								RestartCount: 1,
+							},
+						},
+					},
+				},
+			},
+			stack: &model.Stack{
+				Name: "test",
+				Services: map[string]*model.Service{
+					"test1": {
+						BackOffLimit: 2,
+						DependsOn:    model.DependsOn{},
+					},
+					"test2": {
+						DependsOn: model.DependsOn{
+							"test1": model.DependsOnConditionSpec{
+								Condition: model.DependsOnServiceHealthy,
+							},
+						},
+					},
+				},
+			},
+			err: nil,
+		},
+		{
+			name: "dependent svc reaching backoff",
+			k8sObjects: []runtime.Object{
+				&apiv1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							model.StackNameLabel:        "test",
+							model.StackServiceNameLabel: "test1",
+						},
+					},
+					Status: apiv1.PodStatus{
+						ContainerStatuses: []apiv1.ContainerStatus{
+							{
+								RestartCount: 5,
+							},
+						},
+					},
+				},
+			},
+			stack: &model.Stack{
+				Name: "test",
+				Services: map[string]*model.Service{
+					"test1": {
+						BackOffLimit: 2,
+						DependsOn:    model.DependsOn{},
+					},
+					"test2": {
+						DependsOn: model.DependsOn{
+							"test1": model.DependsOnConditionSpec{
+								Condition: model.DependsOnServiceHealthy,
+							},
+						},
+					},
+				},
+			},
+			err: fmt.Errorf("Service 'test1' has been restarted 5 times. Please check the logs and try again"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewSimpleClientset(tt.k8sObjects...)
+			err := getErrorDueToRestartLimit(context.Background(), tt.stack, "test2", fakeClient)
+			assert.Equal(t, tt.err, err)
+		})
+	}
+
+}
+
+func TestDeployK8sEndpoint(t *testing.T) {
+	tests := []struct {
+		name      string
+		stack     *model.Stack
+		ingresses []runtime.Object
+	}{
+		{
+			name: "deploy public endpoints",
+			stack: &model.Stack{
+				Namespace: "test",
+				Services: model.ComposeServices{
+					"test": &model.Service{},
+				},
+			},
+		},
+		{
+			name: "deploy private endpoints",
+			stack: &model.Stack{
+				Namespace: "test",
+				Services: model.ComposeServices{
+					"test": &model.Service{
+						Annotations: model.Annotations{
+							"dev.okteto.com/private": "true",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "skip deploy endpoint 1",
+			stack: &model.Stack{
+				Namespace: "test",
+				Services: model.ComposeServices{
+					"test": &model.Service{
+						Annotations: model.Annotations{
+							"dev.okteto.com/private": "true",
+						},
+					},
+				},
+			},
+			ingresses: []runtime.Object{
+				&networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							model.StackNameLabel: "",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "skip deploy endpoint 2",
+			stack: &model.Stack{
+				Name:      "test",
+				Namespace: "test",
+				Services: model.ComposeServices{
+					"test": &model.Service{
+						Annotations: model.Annotations{
+							"dev.okteto.com/private": "true",
+						},
+					},
+				},
+			},
+			ingresses: []runtime.Object{
+				&networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							model.StackNameLabel: "test",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewSimpleClientset(tt.ingresses...)
+			c := ingresses.NewIngressClient(fakeClient, true)
+			err := deployK8sEndpoint(context.Background(), "test", "test", model.Port{ContainerPort: 80}, tt.stack, c)
+			assert.NoError(t, err)
+
+			obj, err := c.Get(context.Background(), "test", "test")
+			assert.NoError(t, err)
+			assert.NotNil(t, obj)
 		})
 	}
 }

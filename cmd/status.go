@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,6 +15,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/signal"
 	"time"
@@ -26,13 +27,20 @@ import (
 	"github.com/okteto/okteto/pkg/config"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/okteto"
 	"github.com/okteto/okteto/pkg/syncthing"
+	"github.com/okteto/okteto/pkg/validator"
+	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
 
+const (
+	completedProgress = 100
+)
+
 // Status returns the status of the synchronization process
-func Status() *cobra.Command {
+func Status(fs afero.Fs) *cobra.Command {
 	var devPath string
 	var namespace string
 	var k8sContext string
@@ -40,9 +48,12 @@ func Status() *cobra.Command {
 	var watch bool
 	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Status of the synchronization process",
-		Args:  utils.MaximumNArgsAccepted(1, "https://okteto.com/docs/reference/cli/#status"),
+		Short: "Status of the file synchronization process for a given Development Container",
+		Args:  utils.MaximumNArgsAccepted(1, "https://okteto.com/docs/reference/okteto-cli/#status"),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validator.FileArgumentIsNotDir(fs, devPath); err != nil {
+				return err
+			}
 
 			if okteto.InDevContainer() {
 				return oktetoErrors.ErrNotInDevContainer
@@ -50,10 +61,20 @@ func Status() *cobra.Command {
 
 			ctx := context.Background()
 
-			manifestOpts := contextCMD.ManifestOptions{Filename: devPath, Namespace: namespace, K8sContext: k8sContext}
-			manifest, err := contextCMD.LoadManifestWithContext(ctx, manifestOpts)
+			if err := contextCMD.NewContextCommand().Run(ctx, &contextCMD.Options{Show: true, Namespace: namespace, Context: k8sContext}); err != nil {
+				return err
+			}
+
+			manifestOpts := contextCMD.ManifestOptions{Filename: devPath}
+			manifest, err := model.GetManifestV2(manifestOpts.Filename, afero.NewOsFs())
 			if err != nil {
 				return err
+			}
+
+			if !okteto.IsOkteto() {
+				if err := manifest.ValidateForCLIOnly(); err != nil {
+					return err
+				}
 			}
 
 			devName := ""
@@ -62,15 +83,23 @@ func Status() *cobra.Command {
 			}
 			dev, err := utils.GetDevFromManifest(manifest, devName)
 			if err != nil {
-				return err
+				if !errors.Is(err, utils.ErrNoDevSelected) {
+					return err
+				}
+				selector := utils.NewOktetoSelector("Select which development container's sync status is needed:", "Development container")
+				dev, err = utils.SelectDevFromManifest(manifest, selector, manifest.Dev.GetDevs())
+				if err != nil {
+					return err
+				}
 			}
 
 			waitForStates := []config.UpState{config.Synchronizing, config.Ready}
-			if err := status.Wait(ctx, dev, waitForStates); err != nil {
+			if err := status.Wait(dev, okteto.GetContext().Namespace, waitForStates); err != nil {
 				return err
 			}
 
-			sy, err := syncthing.Load(dev)
+			ctxNamespace := okteto.GetContext().Namespace
+			sy, err := syncthing.Load(dev, ctxNamespace)
 			if err != nil {
 				oktetoLog.Infof("error accessing the syncthing info file: %s", err)
 				return oktetoErrors.ErrNotInDevMode
@@ -92,20 +121,20 @@ func Status() *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().StringVarP(&devPath, "file", "f", utils.DefaultManifest, "path to the manifest file")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "namespace where the up command is executing")
-	cmd.Flags().StringVarP(&k8sContext, "context", "c", "", "context where the up command is executing")
+	cmd.Flags().StringVarP(&devPath, "file", "f", "", "the path to the Okteto Manifest")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "overwrite the current Okteto Namespace")
+	cmd.Flags().StringVarP(&k8sContext, "context", "c", "", "overwrite the current Okteto Context")
 	cmd.Flags().BoolVarP(&showInfo, "info", "i", false, "show syncthing links for troubleshooting the synchronization service")
 	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "watch for changes")
 	return cmd
 }
 
 func runWithWatch(ctx context.Context, sy *syncthing.Syncthing) error {
-	suffix := "Synchronizing your files..."
-	spinner := utils.NewSpinner(suffix)
+	textSpinner := "Synchronizing your files..."
+	oktetoLog.Spinner(textSpinner)
 	pbScaling := 0.30
-	spinner.Start()
-	defer spinner.Stop()
+	oktetoLog.StartSpinner()
+	defer oktetoLog.StopSpinner()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
@@ -121,19 +150,19 @@ func runWithWatch(ctx context.Context, sy *syncthing.Syncthing) error {
 				oktetoLog.Infof("error accessing status: %s", err)
 				continue
 			}
-			if progress == 100 {
+			if progress == completedProgress {
 				message = "Files synchronized"
 			} else {
-				message = utils.RenderProgressBar(suffix, progress, pbScaling)
+				message = utils.RenderProgressBar(textSpinner, progress, pbScaling)
 			}
-			spinner.Update(message)
+			oktetoLog.Spinner(message)
 		}
 	}()
 
 	select {
 	case <-stop:
 		oktetoLog.Infof("CTRL+C received, starting shutdown sequence")
-		spinner.Stop()
+		oktetoLog.StopSpinner()
 		return oktetoErrors.ErrIntSig
 	case err := <-exit:
 		if err != nil {
@@ -149,7 +178,7 @@ func runWithoutWatch(ctx context.Context, sy *syncthing.Syncthing) error {
 	if err != nil {
 		return err
 	}
-	if progress == 100 {
+	if progress == completedProgress {
 		oktetoLog.Success("Synchronization status: %.2f%%", progress)
 	} else {
 		oktetoLog.Yellow("Synchronization status: %.2f%%", progress)

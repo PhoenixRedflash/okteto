@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,199 +15,37 @@ package build
 
 import (
 	"context"
-	"encoding/base64"
-	"fmt"
-	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 
-	"github.com/containerd/console"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/cmd/buildctl/build"
-	"github.com/moby/buildkit/session"
-	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/util/progress/progressui"
-	"github.com/okteto/okteto/pkg/config"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/log/io"
 	"github.com/okteto/okteto/pkg/types"
 	"github.com/pkg/errors"
-	"golang.org/x/oauth2"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc/credentials/oauth"
-)
-
-const (
-	frontend = "dockerfile.v0"
 )
 
 type buildWriter struct{}
 
-// getSolveOpt returns the buildkit solve options
-func getSolveOpt(buildOptions *types.BuildOptions) (*client.SolveOpt, error) {
-	var localDirs map[string]string
-	var frontendAttrs map[string]string
-
-	if uri, err := url.ParseRequestURI(buildOptions.Path); err != nil || (uri != nil && (uri.Scheme == "" || uri.Host == "")) {
-
-		if buildOptions.File == "" {
-			buildOptions.File = filepath.Join(buildOptions.Path, "Dockerfile")
-		}
-		if _, err := os.Stat(buildOptions.File); os.IsNotExist(err) {
-			return nil, fmt.Errorf("Dockerfile '%s' does not exist", buildOptions.File)
-		}
-		localDirs = map[string]string{
-			"context":    buildOptions.Path,
-			"dockerfile": filepath.Dir(buildOptions.File),
-		}
-		frontendAttrs = map[string]string{
-			"filename": filepath.Base(buildOptions.File),
-		}
-	} else {
-		frontendAttrs = map[string]string{
-			"context": buildOptions.Path,
-		}
+func SolveBuild(ctx context.Context, c *client.Client, opt *client.SolveOpt, progress string, ioCtrl *io.Controller) error {
+	logFilterRules := []LogRule{
+		{
+			condition:   BuildKitMissingCacheCondition,
+			transformer: BuildKitMissingCacheTransformer,
+		},
 	}
-
-	if buildOptions.Target != "" {
-		frontendAttrs["target"] = buildOptions.Target
+	errorRules := []ErrorRule{
+		{
+			condition: BuildKitFrontendNotFoundErr,
+		},
 	}
-	if buildOptions.NoCache {
-		frontendAttrs["no-cache"] = ""
-	}
-	for _, buildArg := range buildOptions.BuildArgs {
-		kv := strings.SplitN(buildArg, "=", 2)
-		if len(kv) != 2 {
-			return nil, fmt.Errorf("invalid build-arg value %s", buildArg)
-		}
-		frontendAttrs["build-arg:"+kv[0]] = kv[1]
-	}
-	attachable := []session.Attachable{}
-	if okteto.IsOkteto() {
-		attachable = append(attachable, newDockerAndOktetoAuthProvider(okteto.Context().Registry, okteto.Context().UserID, okteto.Context().Token, os.Stderr))
-	} else {
-		attachable = append(attachable, authprovider.NewDockerAuthProvider(os.Stderr))
-	}
-
-	if len(buildOptions.Secrets) > 0 {
-		secretProvider, err := build.ParseSecret(buildOptions.Secrets)
-		if err != nil {
-			return nil, err
-		}
-		attachable = append(attachable, secretProvider)
-	}
-	opt := &client.SolveOpt{
-		LocalDirs:     localDirs,
-		Frontend:      frontend,
-		FrontendAttrs: frontendAttrs,
-		Session:       attachable,
-		CacheImports:  []client.CacheOptionsEntry{},
-		CacheExports:  []client.CacheOptionsEntry{},
-	}
-
-	if buildOptions.Tag != "" {
-		opt.Exports = []client.ExportEntry{
-			{
-				Type: "image",
-				Attrs: map[string]string{
-					"name": buildOptions.Tag,
-					"push": "true",
-				},
-			},
-		}
-	}
-	for _, cacheFromImage := range buildOptions.CacheFrom {
-		opt.CacheImports = append(
-			opt.CacheImports,
-			client.CacheOptionsEntry{
-				Type:  "registry",
-				Attrs: map[string]string{"ref": cacheFromImage},
-			},
-		)
-	}
-
-	if buildOptions.ExportCache != "" {
-		mode := "min"
-		if buildOptions.ExportCache != buildOptions.Tag {
-			mode = "max"
-		}
-		opt.CacheExports = append(
-			opt.CacheExports,
-			client.CacheOptionsEntry{
-				Type: "registry",
-				Attrs: map[string]string{
-					"ref":  buildOptions.ExportCache,
-					"mode": mode,
-				},
-			},
-		)
-	}
-	return opt, nil
-}
-
-func getBuildkitClient(ctx context.Context) (*client.Client, error) {
-	buildkitHost := okteto.Context().Builder
-	octxStore := okteto.ContextStore()
-	for _, octx := range octxStore.Contexts {
-		//if a context configures buildkit with an Okteto Cluster
-		if octx.IsOkteto && octx.Builder == buildkitHost {
-			okteto.Context().Token = octx.Token
-			okteto.Context().Certificate = octx.Certificate
-		}
-	}
-	if okteto.Context().Certificate != "" {
-		certBytes, err := base64.StdEncoding.DecodeString(okteto.Context().Certificate)
-		if err != nil {
-			return nil, fmt.Errorf("certificate decoding error: %w", err)
-		}
-
-		if err := os.WriteFile(config.GetCertificatePath(), certBytes, 0600); err != nil {
-			return nil, err
-		}
-
-		c, err := getClientForOktetoCluster(ctx)
-		if err != nil {
-			oktetoLog.Infof("failed to create okteto build client: %s", err)
-			return nil, fmt.Errorf("failed to create the builder client: %v", err)
-		}
-
-		return c, nil
-	}
-
-	c, err := client.New(ctx, okteto.Context().Builder, client.WithFailFast())
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to create the builder client for %s", okteto.Context().Builder)
-	}
-	return c, nil
-}
-
-func getClientForOktetoCluster(ctx context.Context) (*client.Client, error) {
-
-	b, err := url.Parse(okteto.Context().Builder)
-	if err != nil {
-		return nil, errors.Wrapf(err, "invalid buildkit host %s", okteto.Context().Builder)
-	}
-
-	creds := client.WithCredentials(b.Hostname(), config.GetCertificatePath(), "", "")
-
-	oauthToken := &oauth2.Token{
-		AccessToken: okteto.Context().Token,
-	}
-
-	rpc := client.WithRPCCreds(oauth.NewOauthAccess(oauthToken))
-	c, err := client.New(ctx, okteto.Context().Builder, client.WithFailFast(), creds, rpc)
-	if err != nil {
-		return nil, err
-	}
-
-	return c, nil
-}
-
-func solveBuild(ctx context.Context, c *client.Client, opt *client.SolveOpt, progress string) error {
+	logFilter := NewBuildKitLogsFilter(logFilterRules, errorRules)
 	ch := make(chan *client.SolveStatus)
 	ttyChannel := make(chan *client.SolveStatus)
 	plainChannel := make(chan *client.SolveStatus)
+	commandFailChannel := make(chan error, 1)
 
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
@@ -224,13 +62,18 @@ func solveBuild(ctx context.Context, c *client.Client, opt *client.SolveOpt, pro
 				return ctx.Err()
 			case ss, ok := <-ch:
 				if ok {
+					logFilter.Run(ss, progress)
 					plainChannel <- ss
 					if progress == oktetoLog.TTYFormat {
 						ttyChannel <- ss
 					}
+					if err := logFilter.GetError(ss); err != nil {
+						commandFailChannel <- err
+					}
 				} else {
 					done = true
 				}
+
 			}
 			if done {
 				close(plainChannel)
@@ -244,23 +87,82 @@ func solveBuild(ctx context.Context, c *client.Client, opt *client.SolveOpt, pro
 	})
 
 	eg.Go(func() error {
-		var c console.Console
+
 		w := &buildWriter{}
-		if progress == oktetoLog.TTYFormat {
-			if cn, err := console.ConsoleFromFile(os.Stdout); err == nil {
-				c = cn
-			} else {
-				oktetoLog.Debugf("could not create console from file: %s ", err)
-			}
-			go progressui.DisplaySolveStatus(context.TODO(), "", c, oktetoLog.GetOutputWriter(), ttyChannel)
+		switch progress {
+		case oktetoLog.TTYFormat:
+			go func() {
+				// We use the plain channel to store the logs into a buffer and then show them in the UI
+				d, err := progressui.NewDisplay(w, progressui.PlainMode)
+				if err != nil {
+					// If an error occurs while attempting to create the tty display,
+					// fallback to using plain mode on stdout (in contrast to stderr).
+					d, err = progressui.NewDisplay(w, progressui.PlainMode)
+					if err != nil {
+						oktetoLog.Infof("could not display build status: %s", err)
+						return
+					}
+				}
+				// not using shared context to not disrupt display but let is finish reporting errors
+				if _, err := d.UpdateFrom(context.TODO(), plainChannel); err != nil {
+					oktetoLog.Infof("could not display build status: %s", err)
+				}
+			}()
 			// not using shared context to not disrupt display but let it finish reporting errors
-			return progressui.DisplaySolveStatus(context.TODO(), "", nil, w, plainChannel)
+			// We need to wait until the tty channel is closed to avoid writing to stdout while the tty is being used
+			d, err := progressui.NewDisplay(os.Stdout, progressui.TtyMode)
+			if err != nil {
+				// If an error occurs while attempting to create the tty display,
+				// fallback to using plain mode on stdout (in contrast to stderr).
+				d, err = progressui.NewDisplay(os.Stdout, progressui.PlainMode)
+				if err != nil {
+					oktetoLog.Infof("could not display build status: %s", err)
+					return err
+				}
+			}
+			// not using shared context to not disrupt display but let is finish reporting errors
+			if _, err := d.UpdateFrom(context.TODO(), ttyChannel); err != nil {
+				oktetoLog.Infof("could not display build status: %s", err)
+			}
+			return err
+		case DeployOutputModeOnBuild, DestroyOutputModeOnBuild, TestOutputModeOnBuild:
+			err := deployDisplayer(context.TODO(), plainChannel, &types.BuildOptions{OutputMode: progress})
+			commandFailChannel <- err
+			return err
+		default:
+			// not using shared context to not disrupt display but let it finish reporting errors
+			d, err := progressui.NewDisplay(ioCtrl.Out(), progressui.PlainMode)
+			if err != nil {
+				// If an error occurs while attempting to create the tty display,
+				// fallback to using plain mode on stdout (in contrast to stderr).
+				d, err = progressui.NewDisplay(os.Stdout, progressui.PlainMode)
+				if err != nil {
+					oktetoLog.Infof("could not display build status: %s", err)
+					return err
+				}
+			}
+			// not using shared context to not disrupt display but let is finish reporting errors
+			if _, err := d.UpdateFrom(context.TODO(), plainChannel); err != nil {
+				oktetoLog.Infof("could not display build status: %s", err)
+			}
+			return err
 		}
-		// not using shared context to not disrupt display but let it finish reporting errors
-		return progressui.DisplaySolveStatus(context.TODO(), "", nil, oktetoLog.GetOutputWriter(), plainChannel)
 	})
 
-	return eg.Wait()
+	err := eg.Wait()
+	// If the command failed, we want to return the error from the command instead of the buildkit error
+	if err != nil {
+		select {
+		case commandErr := <-commandFailChannel:
+			if commandErr != nil {
+				return commandErr
+			}
+			return err
+		default:
+			return err
+		}
+	}
+	return nil
 }
 
 func (*buildWriter) Write(p []byte) (int, error) {

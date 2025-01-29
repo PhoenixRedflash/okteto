@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,13 +16,20 @@ package ssh
 import (
 	"context"
 	"fmt"
+	"net"
 	"runtime"
+	"strconv"
 	"time"
 
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
-	k8sforward "github.com/okteto/okteto/pkg/k8s/forward"
+	k8sForward "github.com/okteto/okteto/pkg/k8s/forward"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
+	forwardModel "github.com/okteto/okteto/pkg/model/forward"
+)
+
+const (
+	maxSystemPorts = 1024
 )
 
 // ForwardManager handles the lifecycle of all the forwards
@@ -30,21 +37,23 @@ type ForwardManager struct {
 	localInterface  string
 	remoteInterface string
 	forwards        map[int]*forward
+	globalForwards  map[int]*forward
 	reverses        map[int]*reverse
 	ctx             context.Context
 	sshAddr         string
-	pf              *k8sforward.PortForwardManager
+	pf              *k8sForward.PortForwardManager
 	pool            *pool
 	namespace       string
 }
 
 // NewForwardManager returns a newly initialized instance of ForwardManager
-func NewForwardManager(ctx context.Context, sshAddr, localInterface, remoteInterface string, pf *k8sforward.PortForwardManager, namespace string) *ForwardManager {
+func NewForwardManager(ctx context.Context, sshAddr, localInterface, remoteInterface string, pf *k8sForward.PortForwardManager, namespace string) *ForwardManager {
 	return &ForwardManager{
 		ctx:             ctx,
 		localInterface:  localInterface,
 		remoteInterface: remoteInterface,
 		forwards:        make(map[int]*forward),
+		globalForwards:  make(map[int]*forward),
 		reverses:        make(map[int]*reverse),
 		sshAddr:         sshAddr,
 		pf:              pf,
@@ -61,12 +70,16 @@ func (fm *ForwardManager) canAdd(localPort int, checkAvailable bool) error {
 		return fmt.Errorf("port %d is listed multiple times, please check your forwards configuration", localPort)
 	}
 
+	if _, ok := fm.globalForwards[localPort]; ok {
+		return fmt.Errorf("port %d is listed multiple times, please check your global forwards configuration", localPort)
+	}
+
 	if !checkAvailable {
 		return nil
 	}
 
 	if !model.IsPortAvailable(fm.localInterface, localPort) {
-		if localPort <= 1024 {
+		if localPort <= maxSystemPorts {
 			os := runtime.GOOS
 			switch os {
 			case "darwin":
@@ -77,26 +90,32 @@ func (fm *ForwardManager) canAdd(localPort int, checkAvailable bool) error {
 				return fmt.Errorf("local port %d is privileged. Try running \"sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/okteto\" and try again", localPort)
 			}
 		}
-		return fmt.Errorf("local port %d is already in-use in your local machine", localPort)
+
+		return fmt.Errorf("local port %d is already in-use in your local machine: %w", localPort, oktetoErrors.ErrPortAlreadyAllocated)
 	}
 
 	return nil
 }
 
 // Add initializes a remote forward
-func (fm *ForwardManager) Add(f model.Forward) error {
+func (fm *ForwardManager) Add(f forwardModel.Forward) error {
+
+	forwardsToUpdate := fm.forwards
+	if f.IsGlobal {
+		forwardsToUpdate = fm.globalForwards
+	}
 
 	if err := fm.canAdd(f.Local, true); err != nil {
 		return err
 	}
 
-	fm.forwards[f.Local] = &forward{
-		localAddress:  fmt.Sprintf("%s:%d", fm.localInterface, f.Local),
-		remoteAddress: fmt.Sprintf("%s:%d", fm.remoteInterface, f.Remote),
+	forwardsToUpdate[f.Local] = &forward{
+		localAddress:  net.JoinHostPort(fm.localInterface, strconv.Itoa(f.Local)),
+		remoteAddress: net.JoinHostPort(fm.remoteInterface, strconv.Itoa(f.Remote)),
 	}
 
 	if f.Service {
-		fm.forwards[f.Local].remoteAddress = fmt.Sprintf("%s:%d", f.ServiceName, f.Remote)
+		forwardsToUpdate[f.Local].remoteAddress = net.JoinHostPort(f.ServiceName, strconv.Itoa(f.Remote))
 	}
 
 	return nil
@@ -107,7 +126,8 @@ func (fm *ForwardManager) Start(devPod, namespace string) error {
 	oktetoLog.Info("starting SSH forward manager")
 
 	ticker := time.NewTicker(200 * time.Millisecond)
-	to := time.Now().Add(10 * time.Second)
+	timeoutDuration := 10 * time.Second
+	to := time.Now().Add(timeoutDuration)
 	retries := 0
 
 	for {
@@ -123,7 +143,7 @@ func (fm *ForwardManager) Start(devPod, namespace string) error {
 
 		c, err := getSSHClientConfig()
 		if err != nil {
-			return fmt.Errorf("failed to get SSH configuration: %s", err)
+			return fmt.Errorf("failed to get SSH configuration: %w", err)
 		}
 
 		oktetoLog.Infof("starting SSH connection pool on %s", fm.sshAddr)
@@ -154,7 +174,6 @@ func (fm *ForwardManager) Start(devPod, namespace string) error {
 	for _, ff := range fm.forwards {
 		ff.pool = fm.pool
 		go ff.start(fm.ctx)
-
 	}
 
 	for _, rt := range fm.reverses {
@@ -179,11 +198,22 @@ func (fm *ForwardManager) Stop() {
 	oktetoLog.Info("stopped SSH forward manager")
 }
 
-func (fm *ForwardManager) TransformLabelsToServiceName(f model.Forward) (model.Forward, error) {
+func (fm *ForwardManager) TransformLabelsToServiceName(f forwardModel.Forward) (forwardModel.Forward, error) {
 	serviceName, err := fm.pf.GetServiceNameByLabel(fm.namespace, f.Labels)
 	if err != nil {
 		return f, err
 	}
 	f.ServiceName = serviceName
 	return f, nil
+}
+
+// StartGlobalForwarding implements from the interface types.forwarder
+// nolint:unparam
+func (fm *ForwardManager) StartGlobalForwarding() error {
+	for _, gf := range fm.globalForwards {
+		gf.pool = fm.pool
+		go gf.start(fm.ctx)
+	}
+
+	return nil
 }

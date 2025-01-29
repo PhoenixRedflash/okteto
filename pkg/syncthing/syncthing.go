@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,25 +19,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"text/template"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/okteto/okteto/pkg/config"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/filesystem"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
-	"golang.org/x/crypto/bcrypt"
-	yaml "gopkg.in/yaml.v2"
-
-	"github.com/google/uuid"
 	"github.com/shirou/gopsutil/process"
+	"github.com/spf13/afero"
+	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -66,41 +69,52 @@ const (
 
 	// GUIPort is the port used by syncthing in the cluster for the http endpoint
 	GUIPort = 8384
+
+	maxRetries = 3
+
+	maxLogTailLinesToRead = 5
+
+	// one line of logs in UTF-8 is between 3-400 bytes
+	maxLogTailChunkByteSize int64 = 1024
 )
+
+var regexErrOpeningDatabase = regexp.MustCompile("Error opening database: mkdir .*: no space left on device")
+var regexInsufficientSpace = regexp.MustCompile("insufficient space on disk for database")
 
 // Syncthing represents the local syncthing process.
 type Syncthing struct {
-	APIKey           string        `yaml:"apikey"`
+	Fs               afero.Fs      `yaml:"-"`
+	Client           *http.Client  `yaml:"-"`
+	cmd              *exec.Cmd     `yaml:"-"`
+	RescanInterval   string        `yaml:"-"`
+	Home             string        `yaml:"-"`
+	RemoteGUIAddress string        `yaml:"remote"`
 	GUIPassword      string        `yaml:"password"`
 	GUIPasswordHash  string        `yaml:"-"`
 	binPath          string        `yaml:"-"`
-	Client           *http.Client  `yaml:"-"`
-	cmd              *exec.Cmd     `yaml:"-"`
-	Folders          []*Folder     `yaml:"folders"`
-	FileWatcherDelay int           `yaml:"-"`
-	ForceSendOnly    bool          `yaml:"-"`
-	ResetDatabase    bool          `yaml:"-"`
 	GUIAddress       string        `yaml:"local"`
-	Home             string        `yaml:"-"`
+	Type             string        `yaml:"-"`
 	LogPath          string        `yaml:"-"`
 	ListenAddress    string        `yaml:"-"`
 	RemoteAddress    string        `yaml:"-"`
+	APIKey           string        `yaml:"apikey"`
+	Compression      string        `yaml:"-"`
 	RemoteDeviceID   string        `yaml:"-"`
-	RemoteGUIAddress string        `yaml:"remote"`
+	Folders          []*Folder     `yaml:"folders"`
+	FileWatcherDelay int           `yaml:"-"`
 	RemoteGUIPort    int           `yaml:"-"`
 	RemotePort       int           `yaml:"-"`
 	LocalGUIPort     int           `yaml:"-"`
 	LocalPort        int           `yaml:"-"`
-	Type             string        `yaml:"-"`
+	pid              int           `yaml:"-"`
+	timeout          time.Duration `yaml:"-"`
+	ForceSendOnly    bool          `yaml:"-"`
+	ResetDatabase    bool          `yaml:"-"`
 	IgnoreDelete     bool          `yaml:"-"`
 	Verbose          bool          `yaml:"-"`
-	pid              int           `yaml:"-"`
-	RescanInterval   string        `yaml:"-"`
-	Compression      string        `yaml:"-"`
-	timeout          time.Duration `yaml:"-"`
 }
 
-//Folder represents a sync folder
+// Folder represents a sync folder
 type Folder struct {
 	Name        string `yaml:"name"`
 	LocalPath   string `yaml:"localPath"`
@@ -155,10 +169,20 @@ type FolderError struct {
 
 // ItemEvent represents an item event of any type in syncthing.
 type ItemEvent struct {
-	Id       int                                        `json:"id"`
-	GlobalId int                                        `json:"globalID"`
 	Time     time.Time                                  `json:"time"`
 	Data     map[string]map[string]DownloadProgressData `json:"data"`
+	Id       int                                        `json:"id"`
+	GlobalId int                                        `json:"globalID"`
+}
+
+// SystemError represents a system error in syncthing.
+type SystemError struct {
+	Message string `json:"message"`
+}
+
+// SystemErrors represents a list of system errors
+type SystemErrors struct {
+	Errors []SystemError `json:"errors"`
 }
 
 // Connections represents syncthing connections.
@@ -171,14 +195,15 @@ type Connection struct {
 	Connected bool `json:"connected"`
 }
 
-// DownloadProgressData represents an the information about a DownloadProgress event
+// DownloadProgressData represents the information about a DownloadProgress event
 type DownloadProgressData struct {
 	BytesTotal int64 `json:"bytesTotal"`
 }
 
 // New constructs a new Syncthing.
-func New(dev *model.Dev) (*Syncthing, error) {
+func New(dev *model.Dev, namespace string, fs afero.Fs) (*Syncthing, error) {
 	fullPath := getInstallPath()
+
 	remotePort, err := model.GetAvailablePort(dev.Interface)
 	if err != nil {
 		return nil, err
@@ -200,7 +225,7 @@ func New(dev *model.Dev) (*Syncthing, error) {
 	}
 
 	pwd := uuid.New().String()
-	hash, err := bcrypt.GenerateFromPassword([]byte(pwd), 0)
+	hash, err := bcrypt.GenerateFromPassword([]byte(pwd), 10)
 	if err != nil {
 		oktetoLog.Infof("couldn't hash the password %s", err)
 		hash = []byte("")
@@ -217,13 +242,13 @@ func New(dev *model.Dev) (*Syncthing, error) {
 		binPath:          fullPath,
 		Client:           NewAPIClient(),
 		FileWatcherDelay: DefaultFileWatcherDelay,
-		GUIAddress:       fmt.Sprintf("%s:%d", dev.Interface, guiPort),
-		Home:             config.GetAppHome(dev.Namespace, dev.Name),
-		LogPath:          GetLogFile(dev.Namespace, dev.Name),
-		ListenAddress:    fmt.Sprintf("%s:%d", dev.Interface, listenPort),
+		GUIAddress:       net.JoinHostPort(dev.Interface, strconv.Itoa(guiPort)),
+		Home:             config.GetAppHome(namespace, dev.Name),
+		LogPath:          GetLogFile(namespace, dev.Name),
+		ListenAddress:    net.JoinHostPort(dev.Interface, strconv.Itoa(listenPort)),
 		RemoteAddress:    fmt.Sprintf("tcp://%s:%d", dev.Interface, remotePort),
 		RemoteDeviceID:   DefaultRemoteDeviceID,
-		RemoteGUIAddress: fmt.Sprintf("%s:%d", dev.Interface, remoteGUIPort),
+		RemoteGUIAddress: net.JoinHostPort(dev.Interface, strconv.Itoa(remoteGUIPort)),
 		LocalGUIPort:     guiPort,
 		LocalPort:        listenPort,
 		RemoteGUIPort:    remoteGUIPort,
@@ -234,7 +259,8 @@ func New(dev *model.Dev) (*Syncthing, error) {
 		Folders:          []*Folder{},
 		RescanInterval:   strconv.Itoa(dev.Sync.RescanInterval),
 		Compression:      compression,
-		timeout:          time.Duration(dev.Timeout.Default),
+		timeout:          dev.Timeout.Default,
+		Fs:               fs,
 	}
 	index := 1
 	for _, sync := range dev.Sync.Folders {
@@ -260,18 +286,18 @@ func New(dev *model.Dev) (*Syncthing, error) {
 
 func (s *Syncthing) initConfig() error {
 	if err := os.MkdirAll(s.Home, 0700); err != nil {
-		return fmt.Errorf("failed to create %s: %s", s.Home, err)
+		return fmt.Errorf("failed to create %s: %w", s.Home, err)
 	}
 
 	if err := s.UpdateConfig(); err != nil {
 		return err
 	}
 
-	if err := os.WriteFile(filepath.Join(s.Home, certFile), cert, 0700); err != nil {
+	if err := os.WriteFile(filepath.Join(s.Home, certFile), cert, 0600); err != nil {
 		return fmt.Errorf("failed to write syncthing certificate: %w", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(s.Home, keyFile), key, 0700); err != nil {
+	if err := os.WriteFile(filepath.Join(s.Home, keyFile), key, 0600); err != nil {
 		return fmt.Errorf("failed to write syncthing key: %w", err)
 	}
 
@@ -285,7 +311,7 @@ func (s *Syncthing) UpdateConfig() error {
 		return fmt.Errorf("failed to write syncthing configuration template: %w", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(s.Home, configFile), buf.Bytes(), 0700); err != nil {
+	if err := os.WriteFile(filepath.Join(s.Home, configFile), buf.Bytes(), 0600); err != nil {
 		return fmt.Errorf("failed to write syncthing configuration file: %w", err)
 	}
 
@@ -293,7 +319,7 @@ func (s *Syncthing) UpdateConfig() error {
 }
 
 // Run starts up a local syncthing process to serve files from.
-func (s *Syncthing) Run(ctx context.Context) error {
+func (s *Syncthing) Run() error {
 	if err := s.initConfig(); err != nil {
 		return err
 	}
@@ -316,7 +342,7 @@ func (s *Syncthing) Run(ctx context.Context) error {
 		cmdArgs = append(cmdArgs, "-verbose")
 	}
 
-	s.cmd = exec.Command(s.binPath, cmdArgs...) //nolint: gas, gosec
+	s.cmd = exec.Command(s.binPath, cmdArgs...) // nolint: gas, gosec
 	s.cmd.Env = append(os.Environ(), "STNOUPGRADE=1")
 
 	if err := s.cmd.Start(); err != nil {
@@ -332,7 +358,7 @@ func (s *Syncthing) Run(ctx context.Context) error {
 	return nil
 }
 
-//WaitForPing waits for syncthing to be ready
+// WaitForPing waits for syncthing to be ready
 func (s *Syncthing) WaitForPing(ctx context.Context, local bool) error {
 	ticker := time.NewTicker(300 * time.Millisecond)
 	to := time.Now().Add(s.timeout)
@@ -342,6 +368,7 @@ func (s *Syncthing) WaitForPing(ctx context.Context, local bool) error {
 		select {
 		case <-ticker.C:
 			if s.Ping(ctx, local) {
+				oktetoLog.Infof("syncthing local=%t is ready", local)
 				return nil
 			}
 			if retries%5 == 0 {
@@ -349,6 +376,11 @@ func (s *Syncthing) WaitForPing(ctx context.Context, local bool) error {
 			}
 
 			if time.Now().After(to) && retries > 10 {
+				// before returning a generic error, we try detecting why syncthing is not ready and return a more accurate error
+				errDetected := s.IdentifyReadinessIssue()
+				if errDetected != nil {
+					return errDetected
+				}
 				return fmt.Errorf("syncthing local=%t didn't respond after %s", local, s.timeout.String())
 			}
 
@@ -359,24 +391,53 @@ func (s *Syncthing) WaitForPing(ctx context.Context, local bool) error {
 	}
 }
 
-//Ping checks if syncthing is available
+// IdentifyReadinessIssue attempts to identify the issue that is preventing syncthing from being ready
+func (s *Syncthing) IdentifyReadinessIssue() error {
+	if s.RegexMatchesLogs(regexErrOpeningDatabase) {
+		return oktetoErrors.ErrInsufficientSpaceOnUserDisk
+	}
+	if s.RegexMatchesLogs(regexInsufficientSpace) {
+		return oktetoErrors.ErrInsufficientSpaceOnUserDisk
+	}
+	return nil
+}
+
+// RegexMatchesLogs checks if a regex matches in the syncthing logs
+func (s *Syncthing) RegexMatchesLogs(regx *regexp.Regexp) bool {
+	lines, err := filesystem.GetLastNLines(s.Fs, s.LogPath, maxLogTailLinesToRead, maxLogTailChunkByteSize)
+	if err != nil {
+		oktetoLog.Infof("error reading syncthing log: %s", err)
+		return false
+	}
+
+	for _, log := range lines {
+		if regx.MatchString(log) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Ping checks if syncthing is available
 func (s *Syncthing) Ping(ctx context.Context, local bool) bool {
-	_, err := s.APICall(ctx, "rest/system/ping", "GET", 200, nil, local, nil, false, 0)
+	_, err := s.APICall(ctx, "rest/system/ping", "GET", http.StatusOK, nil, local, nil, false, 0)
 	if err == nil {
 		return true
 	}
 	if strings.Contains(err.Error(), "Client.Timeout") {
 		return true
 	}
+	oktetoLog.Infof("error pinging syncthing: %s", err.Error())
 	return false
 }
 
-//Overwrite overwrites local changes to the remote syncthing
+// Overwrite overwrites local changes to the remote syncthing
 func (s *Syncthing) Overwrite(ctx context.Context) error {
 	for _, folder := range s.Folders {
 		oktetoLog.Infof("overriding local changes to the remote syncthing path=%s", folder.LocalPath)
 		params := getFolderParameter(folder)
-		_, err := s.APICall(ctx, "rest/db/override", "POST", 200, params, true, nil, false, 3)
+		_, err := s.APICall(ctx, "rest/db/override", "POST", http.StatusOK, params, true, nil, false, maxRetries)
 		if err != nil {
 			oktetoLog.Infof("error posting 'rest/db/override' syncthing API: %s", err)
 			if strings.Contains(err.Error(), "Client.Timeout") {
@@ -389,7 +450,7 @@ func (s *Syncthing) Overwrite(ctx context.Context) error {
 	return nil
 }
 
-//IsAllOverwritten checks if all overwrite operations has been completed
+// IsAllOverwritten checks if all overwrite operations has been completed
 func (s *Syncthing) IsAllOverwritten() bool {
 	for _, folder := range s.Folders {
 		if !folder.Overwritten {
@@ -399,14 +460,14 @@ func (s *Syncthing) IsAllOverwritten() bool {
 	return true
 }
 
-//WaitForConnected waits for local and remote syncthing to be connected
+// WaitForConnected waits for local and remote syncthing to be connected
 func (s *Syncthing) WaitForConnected(ctx context.Context) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	oktetoLog.Info("waiting for remote device to be connected")
 	to := time.Now().Add(s.timeout)
 	for retries := 0; ; retries++ {
 		connections := &Connections{}
-		body, err := s.APICall(ctx, "rest/system/connections", "GET", 200, nil, true, nil, true, 3)
+		body, err := s.APICall(ctx, "rest/system/connections", "GET", http.StatusOK, nil, true, nil, true, maxRetries)
 		if err != nil {
 			oktetoLog.Infof("error getting connections: %s", err.Error())
 			if strings.Contains(err.Error(), "Client.Timeout") {
@@ -441,7 +502,7 @@ func (s *Syncthing) WaitForConnected(ctx context.Context) error {
 	}
 }
 
-//WaitForScanning waits for syncthing to finish initial scanning
+// WaitForScanning waits for syncthing to finish initial scanning
 func (s *Syncthing) WaitForScanning(ctx context.Context, local bool) error {
 	for _, folder := range s.Folders {
 		if err := s.waitForFolderScanning(ctx, folder, local); err != nil {
@@ -455,7 +516,8 @@ func (s *Syncthing) waitForFolderScanning(ctx context.Context, folder *Folder, l
 	ticker := time.NewTicker(100 * time.Millisecond)
 	oktetoLog.Infof("waiting for initial scan to complete path=%s local=%t", folder.LocalPath, local)
 
-	to := time.Now().Add(s.timeout * 10) // 5 minutes
+	timeoutDuration := s.timeout * 10
+	to := time.Now().Add(timeoutDuration) // 5 minutes
 
 	for retries := 0; ; retries++ {
 		status, err := s.GetSyncthingStatus(ctx, folder, local)
@@ -492,7 +554,7 @@ func (s *Syncthing) waitForFolderScanning(ctx context.Context, folder *Folder, l
 func (s *Syncthing) GetCompletion(ctx context.Context, local bool, device string) (*Completion, error) {
 	params := map[string]string{"device": device}
 	completion := &Completion{}
-	body, err := s.APICall(ctx, "rest/db/completion", "GET", 200, params, local, nil, true, 3)
+	body, err := s.APICall(ctx, "rest/db/completion", "GET", http.StatusOK, params, local, nil, true, maxRetries)
 	if err != nil {
 		oktetoLog.Infof("error calling 'rest/db/completion' local=%t syncthing API: %s", local, err)
 		if strings.Contains(err.Error(), "Client.Timeout") {
@@ -509,7 +571,7 @@ func (s *Syncthing) GetCompletion(ctx context.Context, local bool, device string
 }
 
 // IsHealthy returns the syncthing error or nil
-func (s *Syncthing) IsHealthy(ctx context.Context, local bool, max int) error {
+func (s *Syncthing) IsHealthy(ctx context.Context, local bool, maxRetries int) error {
 	pullErrors, err := s.GetPullErrors(ctx, local)
 	if err != nil {
 		if err == oktetoErrors.ErrBusySyncthing {
@@ -531,7 +593,7 @@ func (s *Syncthing) IsHealthy(ctx context.Context, local bool, max int) error {
 		return err
 	}
 
-	if isHealthyRetries <= max {
+	if isHealthyRetries <= maxRetries {
 		return nil
 	}
 	if err == nil || err == oktetoErrors.ErrBusySyncthing {
@@ -550,7 +612,7 @@ func (s *Syncthing) GetSyncthingStatus(ctx context.Context, folder *Folder, loca
 		"events":  "StateChanged",
 	}
 	scList := []StateChangedEvent{}
-	body, err := s.APICall(ctx, "rest/events", "GET", 200, params, local, nil, true, 3)
+	body, err := s.APICall(ctx, "rest/events", "GET", http.StatusOK, params, local, nil, true, maxRetries)
 	if err != nil {
 		oktetoLog.Infof("error getting events: %s", err.Error())
 		if strings.Contains(err.Error(), "Client.Timeout") {
@@ -576,7 +638,7 @@ func (s *Syncthing) GetSyncthingStatus(ctx context.Context, folder *Folder, loca
 	delete(params, "events")
 	delete(params, "limit")
 
-	body, err = s.APICall(ctx, "rest/events", "GET", 200, params, local, nil, true, 3)
+	body, err = s.APICall(ctx, "rest/events", "GET", http.StatusOK, params, local, nil, true, maxRetries)
 	if err != nil {
 		oktetoLog.Infof("error getting events: %s", err.Error())
 		if strings.Contains(err.Error(), "Client.Timeout") {
@@ -612,7 +674,7 @@ func (s *Syncthing) GetPullErrors(ctx context.Context, local bool) (int64, error
 		"events":  "FolderSummary",
 	}
 	fsList := []FolderSummaryEvent{}
-	body, err := s.APICall(ctx, "rest/events", "GET", 200, params, local, nil, true, 3)
+	body, err := s.APICall(ctx, "rest/events", "GET", http.StatusOK, params, local, nil, true, maxRetries)
 	if err != nil {
 		oktetoLog.Infof("error getting events: %s", err.Error())
 		if strings.Contains(err.Error(), "Client.Timeout") {
@@ -638,7 +700,7 @@ func (s *Syncthing) GetPullErrors(ctx context.Context, local bool) (int64, error
 	delete(params, "events")
 	delete(params, "limit")
 
-	body, err = s.APICall(ctx, "rest/events", "GET", 200, params, local, nil, true, 3)
+	body, err = s.APICall(ctx, "rest/events", "GET", http.StatusOK, params, local, nil, true, maxRetries)
 	if err != nil {
 		oktetoLog.Infof("error getting events: %s", err.Error())
 		if strings.Contains(err.Error(), "Client.Timeout") {
@@ -673,7 +735,7 @@ func (s *Syncthing) GetFolderErrors(ctx context.Context, local bool) error {
 		"events":  "FolderErrors",
 	}
 	folderErrorsList := []FolderErrorEvent{}
-	body, err := s.APICall(ctx, "rest/events", "GET", 200, params, local, nil, true, 3)
+	body, err := s.APICall(ctx, "rest/events", "GET", http.StatusOK, params, local, nil, true, maxRetries)
 	if err != nil {
 		oktetoLog.Infof("error getting events: %s", err.Error())
 		if strings.Contains(err.Error(), "Client.Timeout") {
@@ -700,7 +762,7 @@ func (s *Syncthing) GetFolderErrors(ctx context.Context, local bool) error {
 			delete(params, "events")
 			delete(params, "limit")
 
-			body, err = s.APICall(ctx, "rest/events", "GET", 200, params, local, nil, true, 3)
+			body, err = s.APICall(ctx, "rest/events", "GET", http.StatusOK, params, local, nil, true, maxRetries)
 			if err != nil {
 				oktetoLog.Infof("error getting events: %s", err.Error())
 				if strings.Contains(err.Error(), "Client.Timeout") {
@@ -740,7 +802,42 @@ func (s *Syncthing) GetFolderErrors(ctx context.Context, local bool) error {
 	return fmt.Errorf("%s: %s", folderErrors.Data.Errors[0].Path, errMsg)
 }
 
-// GetObjectSyncthing the files syncthing
+// GetSystemErrors returns the system errors identified by syncthing
+func (s *Syncthing) GetSystemErrors(ctx context.Context, local bool) (*SystemErrors, error) {
+	var sysErrs *SystemErrors
+	body, err := s.APICall(ctx, "rest/system/error", "GET", http.StatusOK, nil, local, nil, true, maxRetries)
+	if err != nil {
+		oktetoLog.Infof("error getting system errors: %s", err.Error())
+		if strings.Contains(err.Error(), "Client.Timeout") {
+			return nil, oktetoErrors.ErrBusySyncthing
+		}
+		return nil, oktetoErrors.ErrLostSyncthing
+	}
+
+	err = json.Unmarshal(body, &sysErrs)
+	if err != nil {
+		oktetoLog.Infof("error unmarshalling system errors: %s", err.Error())
+		return nil, oktetoErrors.ErrLostSyncthing
+	}
+
+	return sysErrs, nil
+}
+
+func (s *Syncthing) IsLocalRunningOutOfSpace(ctx context.Context) bool {
+	sysErrs, err := s.GetSystemErrors(ctx, true)
+	if err != nil {
+		oktetoLog.Infof("error getting system errors: %s", err.Error())
+		return false
+	}
+	for _, sysErr := range sysErrs.Errors {
+		if strings.Contains(sysErr.Message, "insufficient space") {
+			return true
+		}
+	}
+	return false
+}
+
+// GetInSynchronizationFile the files syncthing
 func (s *Syncthing) GetInSynchronizationFile(ctx context.Context) string {
 	events := []ItemEvent{}
 	params := map[string]string{
@@ -750,7 +847,7 @@ func (s *Syncthing) GetInSynchronizationFile(ctx context.Context) string {
 		"timeout": "0",
 		"events":  "DownloadProgress",
 	}
-	body, err := s.APICall(ctx, "rest/events", "GET", 200, params, false, nil, true, 0)
+	body, err := s.APICall(ctx, "rest/events", "GET", http.StatusOK, params, false, nil, true, 0)
 	if err != nil {
 		oktetoLog.Infof("error getting GetInSynchronizationItem: %s", err.Error())
 		return ""
@@ -785,18 +882,18 @@ func getInSynchronizationLargestFile(e ItemEvent) string {
 
 // Restart restarts the syncthing process
 func (s *Syncthing) Restart(ctx context.Context) error {
-	_, err := s.APICall(ctx, "rest/system/restart", "POST", 200, nil, true, nil, false, 3)
+	_, err := s.APICall(ctx, "rest/system/restart", "POST", http.StatusOK, nil, true, nil, false, maxRetries)
 	return err
 }
 
 // HardTerminate halts the background process, waits for 1s and kills the process if it is still running
 func (s *Syncthing) HardTerminate() error {
+	oktetoLog.Info("termitating previous syncthing process")
 	pList, err := process.Processes()
 	if err != nil {
 		return err
 	}
 
-	pid := os.Getpid()
 	for _, p := range pList {
 		if p.Pid == 0 {
 			continue
@@ -831,49 +928,14 @@ func (s *Syncthing) HardTerminate() error {
 		}
 
 		oktetoLog.Infof("terminating syncthing %d with wait: %s", p.Pid, s.Home)
-		parent, err := getParent(p)
-		if err != nil {
-			oktetoLog.Info("can not find parent")
-		}
-
-		oktetoLog.Infof("terminating syncthing %d with wait: %s", p.Pid, s.Home)
 		if err := terminate(p, true); err != nil {
 			oktetoLog.Infof("error terminating syncthing %d with wait: %s", p.Pid, err.Error())
 		}
-		if parent != nil && parent.Pid != int32(pid) {
-			if err := terminate(parent, true); err != nil {
-				oktetoLog.Infof("error terminating syncthing %d with wait: %s", p.Pid, err.Error())
-				continue
-			}
-		}
+
 		oktetoLog.Infof("terminated syncthing %d with wait: %s", p.Pid, s.Home)
 	}
 
 	return nil
-}
-
-func getParent(p *process.Process) (*process.Process, error) {
-	name, err := p.Name()
-	if err != nil {
-		return nil, fmt.Errorf("can not get parent name")
-	}
-	parent, err := p.Parent()
-	if err != nil {
-		return nil, fmt.Errorf("can not find parent")
-	}
-	if runtime.GOOS == "windows" && (parent.Pid == 0 || parent.Pid == 4) {
-		return nil, fmt.Errorf("can't remove root process")
-	} else if runtime.GOOS != "windows" && parent.Pid < 100 {
-		return nil, fmt.Errorf("can't remove root process")
-	}
-	pName, err := parent.Name()
-	if err != nil {
-		oktetoLog.Infof("could not get  parent: %s", err)
-	}
-	if pName == name {
-		return getParent(parent)
-	}
-	return parent, nil
 }
 
 // SoftTerminate halts the background process
@@ -883,24 +945,24 @@ func (s *Syncthing) SoftTerminate() error {
 	}
 	p, err := process.NewProcess(int32(s.pid))
 	if err != nil {
-		return fmt.Errorf("error getting syncthing process %d: %s", s.pid, err.Error())
+		return fmt.Errorf("error getting syncthing process %d: %w", s.pid, err)
 	}
 	oktetoLog.Infof("terminating syncthing %d without wait", s.pid)
 	if err := terminate(p, false); err != nil {
-		return fmt.Errorf("error terminating syncthing %d without wait: %s", p.Pid, err.Error())
+		return fmt.Errorf("error terminating syncthing %d without wait: %w", p.Pid, err)
 	}
 	oktetoLog.Infof("terminated syncthing %d without wait", s.pid)
 	return nil
 }
 
 // SaveConfig saves the syncthing object in the dev home folder
-func (s *Syncthing) SaveConfig(dev *model.Dev) error {
+func (s *Syncthing) SaveConfig(dev *model.Dev, namespace string) error {
 	marshalled, err := yaml.Marshal(s)
 	if err != nil {
 		return err
 	}
 
-	syncthingInfoFile := getInfoFile(dev.Namespace, dev.Name)
+	syncthingInfoFile := getInfoFile(namespace, dev.Name)
 	if err := os.WriteFile(syncthingInfoFile, marshalled, 0600); err != nil {
 		return fmt.Errorf("failed to write syncthing info file: %w", err)
 	}
@@ -909,8 +971,8 @@ func (s *Syncthing) SaveConfig(dev *model.Dev) error {
 }
 
 // Load loads the syncthing object from the dev home folder
-func Load(dev *model.Dev) (*Syncthing, error) {
-	syncthingInfoFile := getInfoFile(dev.Namespace, dev.Name)
+func Load(dev *model.Dev, namespace string) (*Syncthing, error) {
+	syncthingInfoFile := getInfoFile(namespace, dev.Name)
 	b, err := os.ReadFile(syncthingInfoFile)
 	if err != nil {
 		return nil, err
@@ -927,8 +989,8 @@ func Load(dev *model.Dev) (*Syncthing, error) {
 }
 
 // RemoveFolder deletes all the files created by the syncthing instance
-func RemoveFolder(dev *model.Dev) error {
-	s, err := New(dev)
+func RemoveFolder(dev *model.Dev, namespace string, fs afero.Fs) error {
+	s, err := New(dev, namespace, fs)
 	if err != nil {
 		return fmt.Errorf("failed to create syncthing instance")
 	}
@@ -974,7 +1036,11 @@ func isDirEmpty(path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			oktetoLog.Debugf("Error closing file %s: %s", path, err)
+		}
+	}()
 
 	_, err = f.Readdirnames(1) // Or f.Readdir(1)
 	if err == io.EOF {

@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -24,8 +24,8 @@ import (
 func Test_getPreviousAppReplicas(t *testing.T) {
 	var twoReplica int32 = 2
 	var tests = []struct {
-		name     string
 		app      App
+		name     string
 		expected int32
 	}{
 		{

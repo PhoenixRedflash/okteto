@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -44,20 +44,17 @@ var (
 
 // TTYCollapseDisplayer displays with a screenbuff
 type TTYCollapseDisplayer struct {
-	stdoutScanner *bufio.Scanner
-	stderrScanner *bufio.Scanner
-	screenbuf     *screenbuf.ScreenBuf
-
-	command        string
-	err            error
-	linesToDisplay []string
-	numberOfLines  int
-
-	commandContext context.Context
-	cancel         context.CancelFunc
-
-	isBuilding            bool
+	err                   error
+	commandContext        context.Context
+	stdoutScanner         *bufio.Scanner
+	stderrScanner         *bufio.Scanner
+	screenbuf             *screenbuf.ScreenBuf
+	cancel                context.CancelFunc
+	command               string
+	linesToDisplay        []string
+	numberOfLines         int
 	buildingpreviousLines int
+	isBuilding            bool
 }
 
 // Display displays a
@@ -96,14 +93,21 @@ func (d *TTYCollapseDisplayer) displayCommand(commandChan chan bool) {
 		for i := 0; i < len(spinnerChars); i++ {
 			select {
 			case <-t.C:
-				width, _, _ := term.GetSize(int(os.Stdout.Fd()))
+				width, _, err := term.GetSize(int(os.Stdout.Fd()))
+				if err != nil {
+					oktetoLog.Infof("Error getting terminal size: %s", err)
+				}
 				commandLines := renderCommand(spinnerChars[i], d.command, width)
 				for _, commandLine := range commandLines {
-					d.screenbuf.Write(commandLine)
+					if _, err := d.screenbuf.Write(commandLine); err != nil {
+						oktetoLog.Infof("Error writing command line: %s", err)
+					}
 				}
 				lines := renderLines(d.linesToDisplay, width)
 				for _, line := range lines {
-					d.screenbuf.Write(line)
+					if _, err := d.screenbuf.Write(line); err != nil {
+						oktetoLog.Infof("Error writing line: %s", err)
+					}
 				}
 				d.screenbuf.Flush()
 			case <-d.commandContext.Done():
@@ -202,20 +206,37 @@ func (d *TTYCollapseDisplayer) CleanUp(err error) {
 	if err == nil {
 		message = renderSuccessCommand(d.command)
 		d.screenbuf.Reset()
-		d.screenbuf.Clear()
-		d.screenbuf.Flush()
-		d.screenbuf.Write(message)
+		if err := d.screenbuf.Clear(); err != nil {
+			oktetoLog.Infof("Error clearing screen: %s", err)
+		}
+		if err := d.screenbuf.Flush(); err != nil {
+			oktetoLog.Infof("Error flushing screen: %s", err)
+		}
+		if _, err := d.screenbuf.Write(message); err != nil {
+			oktetoLog.Infof("Error writing success message: %s", err)
+		}
 		d.screenbuf.Flush()
 	} else {
 		message = renderFailCommand(d.command, err)
 		d.screenbuf.Reset()
-		d.screenbuf.Clear()
-		d.screenbuf.Flush()
-		d.screenbuf.Write(message)
-		width, _, _ := term.GetSize(int(os.Stdout.Fd()))
+		if err := d.screenbuf.Clear(); err != nil {
+			oktetoLog.Infof("Error clearing screen: %s", err)
+		}
+		if err := d.screenbuf.Flush(); err != nil {
+			oktetoLog.Infof("Error flushing screen: %s", err)
+		}
+		if _, err := d.screenbuf.Write(message); err != nil {
+			oktetoLog.Infof("Error writing fail message: %s", err)
+		}
+		width, _, err := term.GetSize(int(os.Stdout.Fd()))
+		if err != nil {
+			oktetoLog.Infof("Error getting terminal size: %s", err)
+		}
 		lines := renderLines(d.linesToDisplay, width)
 		for _, line := range lines {
-			d.screenbuf.Write([]byte(line))
+			if _, err := d.screenbuf.Write(line); err != nil {
+				oktetoLog.Infof("Error writing line: %s", err)
+			}
 		}
 		d.screenbuf.Flush()
 	}

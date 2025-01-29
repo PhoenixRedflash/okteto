@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,6 +16,7 @@ package log
 import (
 	"testing"
 
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -23,8 +24,8 @@ func Test_GetContextResource(t *testing.T) {
 	var tests = []struct {
 		name     string
 		message  string
-		masked   []string
 		expected string
+		masked   []string
 	}{
 		{
 			name:     "no banned words",
@@ -67,6 +68,39 @@ func Test_GetContextResource(t *testing.T) {
 			DisableMasking()
 			result = redactMessage(tt.message)
 			assert.Equal(t, tt.message, result)
+		})
+	}
+}
+
+func TestSetOutputFormat(t *testing.T) {
+	Init(logrus.DebugLevel)
+	var tests = []struct {
+		expectedWriter    interface{}
+		name              string
+		hasSpinnerSupport bool
+	}{
+		{
+			name:              "tty",
+			expectedWriter:    &TTYWriter{},
+			hasSpinnerSupport: true,
+		},
+		{
+			name:              "plain",
+			expectedWriter:    &PlainWriter{},
+			hasSpinnerSupport: false,
+		},
+		{
+			name:              "json",
+			expectedWriter:    &JSONWriter{},
+			hasSpinnerSupport: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			SetOutputFormat(tt.name)
+			assert.IsType(t, tt.expectedWriter, log.writer)
+			assert.Equal(t, tt.hasSpinnerSupport, log.spinner.spinnerSupport)
 		})
 	}
 }

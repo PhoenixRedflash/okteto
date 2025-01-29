@@ -1,0 +1,23 @@
+comment:
+  layout: header, changes, diff, sunburst
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: '1%' # Not set to 0% to avoid failues due to -0.0X% deltas
+
+    patch:
+      default:
+        target: 75%
+        only_pulls: true
+
+github_checks:
+  annotations: false
+
+ignore:
+  - '**/*_test.go'
+  - integration/*
+  - scripts/*
+  - internal/*

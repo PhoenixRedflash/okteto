@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -47,17 +47,20 @@ func newTTYDisplayer(stdout, stderr io.Reader) *ttyDisplayer {
 		stderrScanner = bufio.NewScanner(stderr)
 	}
 
+	commandContext, cancel := context.WithCancel(context.Background())
+
 	return &ttyDisplayer{
-		stdoutScanner: stdoutScanner,
-		stderrScanner: stderrScanner,
-		screenbuf:     screenbuf.New(os.Stdout),
+		stdoutScanner:  stdoutScanner,
+		stderrScanner:  stderrScanner,
+		screenbuf:      screenbuf.New(os.Stdout),
+		commandContext: commandContext,
+		cancel:         cancel,
 
 		linesToDisplay: []string{},
 	}
 }
 
-func (d *ttyDisplayer) Display(command string) {
-	d.commandContext, d.cancel = context.WithCancel(context.Background())
+func (d *ttyDisplayer) Display(_ string) {
 	var wg sync.WaitGroup
 	wgDelta := 0
 	if d.stdoutScanner != nil {

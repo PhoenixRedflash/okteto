@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,8 +27,8 @@ import (
 )
 
 // CreateDev deploys a default k8s service for a development container
-func CreateDev(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset) error {
-	s := translate(dev)
+func CreateDev(ctx context.Context, dev *model.Dev, namespace string, c kubernetes.Interface) error {
+	s := translate(dev, namespace)
 	return Deploy(ctx, s, c)
 }
 
@@ -36,25 +36,36 @@ func CreateDev(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset) err
 func Deploy(ctx context.Context, s *apiv1.Service, c kubernetes.Interface) error {
 	old, err := Get(ctx, s.Name, s.Namespace, c)
 	if err != nil && !oktetoErrors.IsNotFound(err) {
-		return fmt.Errorf("error getting kubernetes service: %s", err)
+		return fmt.Errorf("error getting kubernetes service: %w", err)
 	}
 
-	if old.Name == "" {
+	if old == nil || old.Name == "" {
 		oktetoLog.Infof("creating service '%s'", s.Name)
 		_, err = c.CoreV1().Services(s.Namespace).Create(ctx, s, metav1.CreateOptions{})
 		if err != nil {
-			return fmt.Errorf("error creating kubernetes service: %s", err)
+			return fmt.Errorf("error creating kubernetes service: %w", err)
 		}
 		oktetoLog.Infof("created service '%s'", s.Name)
 	} else {
 		oktetoLog.Infof("updating service '%s'", s.Name)
+
+		isDivertDeploy := old.Spec.Type == apiv1.ServiceTypeExternalName && old.Annotations[model.OktetoAutoCreateAnnotation] == "true"
+
 		old.Annotations = s.Annotations
 		old.Labels = s.Labels
 		old.Spec.Ports = s.Spec.Ports
 		old.Spec.Selector = s.Spec.Selector
+
+		if s.Spec.Type == apiv1.ServiceTypeClusterIP {
+			if isDivertDeploy {
+				old.Spec.Type = s.Spec.Type
+				old.Spec.ExternalName = s.Spec.ExternalName
+			}
+		}
+
 		_, err = c.CoreV1().Services(s.Namespace).Update(ctx, old, metav1.UpdateOptions{})
 		if err != nil {
-			return fmt.Errorf("error updating kubernetes service: %s", err)
+			return fmt.Errorf("error updating kubernetes service: %w", err)
 		}
 		oktetoLog.Infof("updated service '%s'.", s.Name)
 	}
@@ -64,6 +75,11 @@ func Deploy(ctx context.Context, s *apiv1.Service, c kubernetes.Interface) error
 // Get returns a kubernetes service by the name, or an error if it doesn't exist
 func Get(ctx context.Context, name, namespace string, c kubernetes.Interface) (*apiv1.Service, error) {
 	return c.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+}
+
+// Update updates a k8s service
+func Update(ctx context.Context, namespace string, svc *apiv1.Service, c kubernetes.Interface) (*apiv1.Service, error) {
+	return c.CoreV1().Services(namespace).Update(ctx, svc, metav1.UpdateOptions{})
 }
 
 // List returns the list of services
@@ -81,8 +97,8 @@ func List(ctx context.Context, namespace, labels string, c kubernetes.Interface)
 }
 
 // DestroyDev destroys the default service for a development container
-func DestroyDev(ctx context.Context, dev *model.Dev, c kubernetes.Interface) error {
-	return Destroy(ctx, dev.Name, dev.Namespace, c)
+func DestroyDev(ctx context.Context, dev *model.Dev, namespace string, c kubernetes.Interface) error {
+	return Destroy(ctx, dev.Name, namespace, c)
 }
 
 // Destroy destroys a k8s service
@@ -94,35 +110,10 @@ func Destroy(ctx context.Context, name, namespace string, c kubernetes.Interface
 			oktetoLog.Infof("service '%s' was already deleted.", name)
 			return nil
 		}
-		return fmt.Errorf("error deleting kubernetes service: %s", err)
+		return fmt.Errorf("error deleting kubernetes service: %w", err)
 	}
 	oktetoLog.Infof("service '%s' deleted", name)
 	return nil
-}
-
-// GetPortsByPod returns the ports exposed via endpoint of a given pod
-func GetPortsByPod(ctx context.Context, p *apiv1.Pod, c kubernetes.Interface) ([]int, error) {
-	eList, err := c.CoreV1().Endpoints(p.Namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	result := []int{}
-	for _, e := range eList.Items {
-		for _, s := range e.Subsets {
-			for _, a := range append(s.Addresses, s.NotReadyAddresses...) {
-				if a.TargetRef == nil {
-					continue
-				}
-				if a.TargetRef.UID == p.UID {
-					for _, p := range s.Ports {
-						result = append(result, int(p.Port))
-					}
-					break
-				}
-			}
-		}
-	}
-	return result, nil
 }
 
 // GetServiceNameByLabel returns the name of the service with certain labels
@@ -133,13 +124,13 @@ func GetServiceNameByLabel(ctx context.Context, namespace string, c kubernetes.I
 	}
 	foundServices := serviceList.Items
 	if len(foundServices) == 0 {
-		return "", fmt.Errorf("Could not find any service with the following labels: '%s'.", labels)
+		return "", fmt.Errorf("could not find any service with the following labels: '%s'", labels)
 	} else if len(foundServices) == 1 {
 		serviceInfo := foundServices[0].ObjectMeta
 		return serviceInfo.Name, nil
 	}
 	servicesNames := GetServicesNamesFromList(serviceList)
-	return "", fmt.Errorf("Services [%s] have the following labels: '%s'.\nPlease specify the one you want to forward by name or use more specific labels.", servicesNames, labels)
+	return "", fmt.Errorf("services [%s] have the following labels: '%s'.\nPlease specify the one you want to forward by name or use more specific labels", servicesNames, labels)
 }
 
 func GetServicesNamesFromList(serviceList *apiv1.ServiceList) string {

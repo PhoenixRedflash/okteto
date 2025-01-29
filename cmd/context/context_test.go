@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,7 +21,7 @@ import (
 
 	"github.com/okteto/okteto/internal/test"
 	"github.com/okteto/okteto/pkg/config"
-	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/constants"
 	"github.com/okteto/okteto/pkg/okteto"
 )
 
@@ -34,18 +34,18 @@ func Test_initFromDeprecatedToken(t *testing.T) {
 	}{
 		{
 			name:     "token-create-kubeconfig",
-			tokenUrl: "https://cloud.okteto.com",
+			tokenUrl: "https://okteto.example.com",
 			kubeconfigCtx: test.KubeconfigFields{
 				Name:           []string{"test"},
 				Namespace:      []string{"test"},
-				CurrentContext: "cloud_okteto_com",
+				CurrentContext: "okteto_example_com",
 			},
 		},
 		{
 			name:     "token-token-but-not-in-kubeconfig",
-			tokenUrl: "https://cloud.okteto.com",
+			tokenUrl: "https://okteto.example.com",
 			kubeconfigCtx: test.KubeconfigFields{
-				Name:           []string{"cloud_okteto_com"},
+				Name:           []string{"okteto_example_com"},
 				Namespace:      []string{"test"},
 				CurrentContext: "test",
 			},
@@ -54,7 +54,7 @@ func Test_initFromDeprecatedToken(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tokenPath, err := createDeprecatedToken(tt.tokenUrl)
+			tokenPath, err := createDeprecatedToken(t, tt.tokenUrl)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -66,19 +66,15 @@ func Test_initFromDeprecatedToken(t *testing.T) {
 			}
 			defer os.Remove(kubepath)
 			okteto.InitContextWithDeprecatedToken()
-			if okteto.ContextStore().CurrentContext == "" {
+			if okteto.GetContextStore().CurrentContext == "" {
 				t.Fatal("Not initialized")
 			}
 		})
 	}
 }
 
-func createDeprecatedToken(url string) (string, error) {
-	dir, err := os.MkdirTemp("", "")
-	if err != nil {
-		return "", err
-	}
-	os.Setenv(model.OktetoFolderEnvVar, dir)
+func createDeprecatedToken(t *testing.T, url string) (string, error) {
+	t.Setenv(constants.OktetoFolderEnvVar, t.TempDir())
 	token := &okteto.Token{
 		URL:       url,
 		Buildkit:  "buildkit",

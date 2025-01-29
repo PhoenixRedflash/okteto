@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,19 +16,25 @@ package okteto
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/constants"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/filesystem"
 	"github.com/okteto/okteto/pkg/k8s/kubeconfig"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/log/io"
 	"github.com/okteto/okteto/pkg/types"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,40 +45,47 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
-type OktetoContextStore struct {
-	Contexts       map[string]*OktetoContext `json:"contexts"`
-	CurrentContext string                    `json:"current-context"`
+type ContextStore struct {
+	Contexts       map[string]*Context `json:"contexts"`
+	CurrentContext string              `json:"current-context"`
 }
 
 const (
 	localClusterType  = "local"
 	remoteClusterType = "remote"
+	hoursInADay       = 24
+	hoursInAWeek      = 168
 )
 
 var (
-	CurrentStore *OktetoContextStore
+	CurrentStore *ContextStore
+	reg          = regexp.MustCompile("[^A-Za-z0-9]+")
 )
 
-// OktetoContext contains the information related to an okteto context
-type OktetoContext struct {
-	Name              string               `json:"name" yaml:"name,omitempty"`
-	UserID            string               `json:"id,omitempty" yaml:"id,omitempty"`
-	Username          string               `json:"username,omitempty" yaml:"username,omitempty"`
-	Token             string               `json:"token,omitempty" yaml:"token,omitempty"`
-	Namespace         string               `json:"namespace" yaml:"namespace,omitempty"`
-	Cfg               *clientcmdapi.Config `json:"-" yaml:"-"`
-	Builder           string               `json:"builder,omitempty" yaml:"builder,omitempty"`
-	Registry          string               `json:"registry,omitempty" yaml:"registry,omitempty"`
-	Certificate       string               `json:"certificate,omitempty" yaml:"certificate,omitempty"`
-	PersonalNamespace string               `json:"personalNamespace,omitempty" yaml:"personalNamespace,omitempty"`
-	GlobalNamespace   string               `json:"-" yaml:"-"`
-	Analytics         bool                 `json:"-" yaml:"-"`
-	ClusterType       string               `json:"-" yaml:"-"`
-	IsOkteto          bool                 `json:"isOkteto,omitempty" yaml:"isOkteto,omitempty"`
+// Context contains the information related to an okteto context
+type Context struct {
+	Cfg                *clientcmdapi.Config `json:"-" yaml:"-"`
+	Name               string               `json:"name" yaml:"name,omitempty"`
+	UserID             string               `json:"id,omitempty" yaml:"id,omitempty"`
+	Username           string               `json:"username,omitempty" yaml:"username,omitempty"`
+	Token              string               `json:"token,omitempty" yaml:"token,omitempty"`
+	Namespace          string               `json:"namespace" yaml:"namespace,omitempty"`
+	Builder            string               `json:"builder,omitempty" yaml:"builder,omitempty"`
+	Registry           string               `json:"registry,omitempty" yaml:"registry,omitempty"`
+	Certificate        string               `json:"certificate,omitempty" yaml:"certificate,omitempty"`
+	PersonalNamespace  string               `json:"personalNamespace,omitempty" yaml:"personalNamespace,omitempty"`
+	GlobalNamespace    string               `json:"-" yaml:"-"`
+	ClusterType        string               `json:"-" yaml:"-"`
+	CompanyName        string               `json:"-" yaml:"-"`
+	IsOkteto           bool                 `json:"isOkteto,omitempty" yaml:"isOkteto,omitempty"`
+	IsStoredAsInsecure bool                 `json:"isInsecure,omitempty" yaml:"isInsecure,omitempty"`
+	IsInsecure         bool                 `json:"-" yaml:"-"`
+	Analytics          bool                 `json:"-" yaml:"-"`
+	IsTrial            bool                 `json:"-" yaml:"-"`
 }
 
-// OktetoContextViewer contains info to show
-type OktetoContextViewer struct {
+// ContextViewer contains info to show
+type ContextViewer struct {
 	Name      string `json:"name" yaml:"name,omitempty"`
 	Namespace string `json:"namespace" yaml:"namespace,omitempty"`
 	Builder   string `json:"builder,omitempty" yaml:"builder,omitempty"`
@@ -83,7 +96,7 @@ type OktetoContextViewer struct {
 // InitContextWithDeprecatedToken initializes the okteto context if an old fashion exists and it matches the current kubernetes context
 // this function is to make "okteto context" transparent to current Okteto Enterprise users, but it can be removed when people upgrade
 func InitContextWithDeprecatedToken() {
-	if !model.FileExists(config.GetTokenPathDeprecated()) {
+	if !filesystem.FileExists(config.GetTokenPathDeprecated()) {
 		return
 	}
 
@@ -99,7 +112,7 @@ func InitContextWithDeprecatedToken() {
 		return
 	}
 
-	ctxStore := ContextStore()
+	ctxStore := GetContextStore()
 	if _, ok := ctxStore.Contexts[token.URL]; ok {
 		return
 	}
@@ -110,7 +123,7 @@ func InitContextWithDeprecatedToken() {
 		return
 	}
 
-	ctxStore.Contexts[token.URL] = &OktetoContext{
+	ctxStore.Contexts[token.URL] = &Context{
 		Name:        token.URL,
 		Namespace:   kubeconfig.CurrentNamespace(config.GetKubeconfigPath()),
 		Token:       token.Token,
@@ -126,7 +139,23 @@ func InitContextWithDeprecatedToken() {
 	}
 }
 
-//ContextExists checks if an okteto context has been created
+func getTokenFromOktetoHome() (*Token, error) {
+	p := config.GetTokenPathDeprecated()
+
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil, err
+	}
+
+	currentToken := &Token{}
+	if err := json.Unmarshal(b, currentToken); err != nil {
+		return nil, err
+	}
+
+	return currentToken, nil
+}
+
+// ContextExists checks if an okteto context has been created
 func ContextExists() bool {
 	oktetoContextFolder := config.GetOktetoContextsStorePath()
 	if _, err := os.Stat(oktetoContextFolder); err != nil {
@@ -139,14 +168,18 @@ func ContextExists() bool {
 }
 
 func UrlToKubernetesContext(uri string) string {
-	u, _ := url.Parse(uri)
+	u, err := url.Parse(uri)
+	if err != nil {
+		oktetoLog.Infof("error parsing url '%s': %v", uri, err)
+		return uri
+	}
 	return strings.ReplaceAll(u.Host, ".", "_")
 }
 
-// K8sContextToOktetoUrl translates k8s contexts like cloud_okteto_com to hettps://cloud.okteto.com
+// K8sContextToOktetoUrl translates k8s contexts like okteto_example_com to https://okteto.example.com
 func K8sContextToOktetoUrl(ctx context.Context, k8sContext, k8sNamespace string, clientProvider K8sClientProvider) string {
-	ctxStore := ContextStore()
-	//check if belongs to the okteto contexts
+	ctxStore := GetContextStore()
+	// check if belongs to the okteto contexts
 	for name, oCtx := range ctxStore.Contexts {
 		if oCtx.IsOkteto && UrlToKubernetesContext(name) == k8sContext {
 			return name
@@ -165,13 +198,14 @@ func K8sContextToOktetoUrl(ctx context.Context, k8sContext, k8sNamespace string,
 		return k8sContext
 	}
 
-	//check the namespace label
+	// check the namespace label
 	if k8sNamespace == "" {
-		k8sNamespace = cfg.Contexts[k8sContext].Namespace
-	}
-
-	if k8sNamespace == "" {
-		return k8sContext
+		cfgK8sNamespace, exists := cfg.Contexts[k8sContext]
+		if exists {
+			k8sNamespace = cfgK8sNamespace.Namespace
+		} else {
+			return k8sContext
+		}
 	}
 
 	n, err := c.CoreV1().Namespaces().Get(ctx, k8sNamespace, metav1.GetOptions{})
@@ -179,65 +213,69 @@ func K8sContextToOktetoUrl(ctx context.Context, k8sContext, k8sNamespace string,
 		oktetoLog.Debugf("error accessing current namespace: %v", err)
 		return k8sContext
 	}
-	if _, ok := n.Labels[model.DevLabel]; ok {
-		return n.Annotations[model.OktetoURLAnnotation]
+	if _, ok := n.Labels[constants.DevLabel]; ok {
+		return n.Annotations[constants.OktetoURLAnnotation]
 	}
 
 	return k8sContext
 }
 
 func IsContextInitialized() bool {
-	ctxStore := ContextStore()
+	ctxStore := GetContextStore()
 	return ctxStore.CurrentContext != ""
 }
 
 func IsOkteto() bool {
-	return Context().IsOkteto
+	return GetContext().IsOkteto
 }
 
-func ContextStore() *OktetoContextStore {
+func GetContextStore() *ContextStore {
 	if CurrentStore != nil {
 		return CurrentStore
 	}
 
 	if ContextExists() {
-		b, err := os.ReadFile(config.GetOktetoContextsStorePath())
-		if err != nil {
-			oktetoLog.Errorf("error reading okteto contexts: %v", err)
-			oktetoLog.Fatalf(oktetoErrors.ErrCorruptedOktetoContexts, config.GetOktetoContextFolder())
-		}
-
-		dec := json.NewDecoder(bytes.NewReader(b))
-		dec.DisallowUnknownFields() // Force errors
-
-		ctxStore := &OktetoContextStore{}
-		if err := dec.Decode(&ctxStore); err != nil {
-			oktetoLog.Errorf("error decoding okteto contexts: %v", err)
-			oktetoLog.Fatalf(oktetoErrors.ErrCorruptedOktetoContexts, config.GetOktetoContextFolder())
+		ctxStore := GetContextStoreFromStorePath()
+		if ctxStore.Contexts == nil {
+			ctxStore.Contexts = map[string]*Context{}
 		}
 		CurrentStore = ctxStore
-
-		if _, ok := CurrentStore.Contexts[CurrentStore.CurrentContext]; !ok {
-			return CurrentStore
-		}
-		return CurrentStore
+		return ctxStore
 	}
 
-	CurrentStore = &OktetoContextStore{
-		Contexts: map[string]*OktetoContext{},
+	CurrentStore = &ContextStore{
+		Contexts: map[string]*Context{},
 	}
 	return CurrentStore
 }
 
-func Context() *OktetoContext {
-	c := ContextStore()
+func GetContextStoreFromStorePath() *ContextStore {
+	b, err := os.ReadFile(config.GetOktetoContextsStorePath())
+	if err != nil {
+		oktetoLog.Errorf("error reading okteto contexts: %v", err)
+		oktetoLog.Fatalf(oktetoErrors.ErrCorruptedOktetoContexts, config.GetOktetoContextFolder())
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields() // Force errors
+
+	ctxStore := &ContextStore{}
+	if err := dec.Decode(&ctxStore); err != nil {
+		oktetoLog.Errorf("error decoding okteto contexts: %v", err)
+		oktetoLog.Fatalf(oktetoErrors.ErrCorruptedOktetoContexts, config.GetOktetoContextFolder())
+	}
+	return ctxStore
+}
+
+func GetContext() *Context {
+	c := GetContextStore()
 	if c.CurrentContext == "" {
-		oktetoLog.Info("ContextStore().CurrentContext is empty")
+		oktetoLog.Info("GetContextStore().CurrentContext is empty")
 		oktetoLog.Fatalf(oktetoErrors.ErrCorruptedOktetoContexts, config.GetOktetoContextFolder())
 	}
 	octx, ok := c.Contexts[c.CurrentContext]
 	if !ok {
-		oktetoLog.Info("ContextStore().CurrentContext not in ContextStore().Contexts")
+		oktetoLog.Info("GetContextStore().CurrentContext not in GetContextStore().Contexts")
 		oktetoLog.Fatalf(oktetoErrors.ErrCorruptedOktetoContexts, config.GetOktetoContextFolder())
 	}
 
@@ -245,36 +283,38 @@ func Context() *OktetoContext {
 }
 
 func HasBeenLogged(oktetoURL string) bool {
-	octxStore := ContextStore()
+	octxStore := GetContextStore()
 	_, ok := octxStore.Contexts[oktetoURL]
 	return ok
 }
 
 func AddOktetoContext(name string, u *types.User, namespace, personalNamespace string) {
-	CurrentStore = ContextStore()
+	CurrentStore = GetContextStore()
 	name = strings.TrimSuffix(name, "/")
-	CurrentStore.Contexts[name] = &OktetoContext{
-		Name:              name,
-		UserID:            u.ID,
-		Username:          u.ExternalID,
-		Token:             u.Token,
-		Namespace:         namespace,
-		PersonalNamespace: personalNamespace,
-		GlobalNamespace:   u.GlobalNamespace,
-		Builder:           u.Buildkit,
-		Registry:          u.Registry,
-		Certificate:       u.Certificate,
-		Analytics:         u.Analytics,
+	if CurrentStore.Contexts[name] == nil {
+		CurrentStore.Contexts[name] = &Context{}
 	}
+	current := CurrentStore.Contexts[name]
+	current.Name = name
+	current.UserID = u.ID
+	current.Username = u.ExternalID
+	current.Token = u.Token
+	current.Namespace = namespace
+	current.PersonalNamespace = personalNamespace
+	current.GlobalNamespace = u.GlobalNamespace
+	current.Builder = u.Buildkit
+	current.Registry = u.Registry
+	current.Certificate = u.Certificate
+	current.Analytics = u.Analytics
+
 	CurrentStore.CurrentContext = name
 }
 
-func AddKubernetesContext(name, namespace, buildkitURL string) {
-	CurrentStore = ContextStore()
-	CurrentStore.Contexts[name] = &OktetoContext{
+func AddKubernetesContext(name, namespace string) {
+	CurrentStore = GetContextStore()
+	CurrentStore.Contexts[name] = &Context{
 		Name:      name,
 		Namespace: namespace,
-		Builder:   buildkitURL,
 		Analytics: true,
 	}
 	CurrentStore.CurrentContext = name
@@ -284,7 +324,7 @@ type ContextConfigWriterInterface interface {
 	Write() error
 }
 
-//ContextConfigWriter writes the information about the context config into stdout
+// ContextConfigWriter writes the information about the context config into stdout
 type ContextConfigWriter struct{}
 
 func NewContextConfigWriter() *ContextConfigWriter {
@@ -292,7 +332,7 @@ func NewContextConfigWriter() *ContextConfigWriter {
 }
 
 func (*ContextConfigWriter) Write() error {
-	marshalled, err := json.MarshalIndent(ContextStore(), "", "\t")
+	marshalled, err := json.MarshalIndent(GetContextStore(), "", "\t")
 	if err != nil {
 		oktetoLog.Infof("failed to marshal context: %s", err)
 		return fmt.Errorf("failed to generate your context")
@@ -307,32 +347,47 @@ func (*ContextConfigWriter) Write() error {
 	if _, err := os.Stat(contextConfigPath); err == nil {
 		err = os.Chmod(contextConfigPath, 0600)
 		if err != nil {
-			return fmt.Errorf("couldn't change context permissions: %s", err)
+			return fmt.Errorf("couldn't change context permissions: %w", err)
 		}
 	}
 
 	if err := os.WriteFile(contextConfigPath, marshalled, 0600); err != nil {
-		return fmt.Errorf("couldn't save context: %s", err)
+		return fmt.Errorf("couldn't save context: %w", err)
 	}
 
 	return nil
 }
 
-func AddOktetoCredentialsToCfg(cfg *clientcmdapi.Config, cred *types.Credential, namespace, userName, oktetoURL string) {
+// AddOktetoCredentialsToCfg populates the provided kubernetes config using the provided credentials obtained from the Okteto API
+func AddOktetoCredentialsToCfg(cfg *clientcmdapi.Config, cred *types.Credential, namespace, userName string, oktetoContext Context) error {
 	// If the context is being initialized within the execution of `okteto deploy` deploy command it should not
 	// write the Okteto credentials into the kubeconfig. It would overwrite the proxy settings
-	if os.Getenv(model.OktetoSkipConfigCredentialsUpdate) == "true" {
-		return
+	if os.Getenv(constants.OktetoSkipConfigCredentialsUpdate) == "true" {
+		return nil
 	}
 
-	clusterName := UrlToKubernetesContext(oktetoURL)
+	clusterName := UrlToKubernetesContext(oktetoContext.Name)
 	// create cluster
 	cluster, ok := cfg.Clusters[clusterName]
 	if !ok {
 		cluster = clientcmdapi.NewCluster()
 	}
 
-	cluster.CertificateAuthorityData = []byte(cred.Certificate)
+	// If the certificate included in the credentials is empty, it means that the server is kubernetes.subdomain.
+	// In that case, if the okteto context is insecure, we need to specify the certificate we have in our context.
+	// If it is not insecure it means that is a public CA or a private one already installed in the machine
+	cert := cred.Certificate
+	if cred.Certificate == "" && oktetoContext.IsStoredAsInsecure {
+		certPEM, err := base64.StdEncoding.DecodeString(oktetoContext.Certificate)
+		if err != nil {
+			oktetoLog.Debugf("couldn't decode context certificate from base64: %s", err)
+			return fmt.Errorf("failed to decode context certificate: %w", err)
+		}
+
+		cert = string(certPEM)
+	}
+
+	cluster.CertificateAuthorityData = []byte(cert)
 	cluster.Server = cred.Server
 	cfg.Clusters[clusterName] = cluster
 
@@ -352,49 +407,64 @@ func AddOktetoCredentialsToCfg(cfg *clientcmdapi.Config, cred *types.Credential,
 	if context.Extensions == nil {
 		context.Extensions = map[string]runtime.Object{}
 	}
-	context.Extensions[model.OktetoExtension] = nil
+	context.Extensions[constants.OktetoExtension] = nil
 	context.Cluster = clusterName
 	context.AuthInfo = userName
 	context.Namespace = namespace
 	cfg.Contexts[clusterName] = context
 
 	cfg.CurrentContext = clusterName
+
+	return nil
 }
 
+// GetK8sClient returns a kubernetes client for the current okteto context and a kubernetes config object
 func GetK8sClient() (*kubernetes.Clientset, *rest.Config, error) {
-	if Context().Cfg == nil {
+	if GetContext().Cfg == nil {
 		return nil, nil, fmt.Errorf("okteto context not initialized")
 	}
-	c, config, err := getK8sClientWithApiConfig(Context().Cfg)
+	c, config, err := getK8sClientWithApiConfig(GetContext().Cfg, nil)
 	if err == nil {
-		Context().SetClusterType(config.Host)
+		GetContext().SetClusterType(config.Host)
+	}
+	return c, config, err
+}
+
+// GetK8sClientWithLogger returns a kubernetes client for the current okteto context and a kubernetes config object
+func GetK8sClientWithLogger(oktetoK8sLogger *io.K8sLogger) (*kubernetes.Clientset, *rest.Config, error) {
+	if GetContext().Cfg == nil {
+		return nil, nil, fmt.Errorf("okteto context not initialized")
+	}
+	c, config, err := getK8sClientWithApiConfig(GetContext().Cfg, oktetoK8sLogger)
+	if err == nil {
+		GetContext().SetClusterType(config.Host)
 	}
 	return c, config, err
 }
 
 // GetDynamicClient returns a kubernetes dynamic client for the current okteto context
 func GetDynamicClient() (dynamic.Interface, *rest.Config, error) {
-	if Context().Cfg == nil {
+	if GetContext().Cfg == nil {
 		return nil, nil, fmt.Errorf("okteto context not initialized")
 	}
-	return getDynamicClient(Context().Cfg)
+	return getDynamicClient(GetContext().Cfg)
 }
 
 // GetDiscoveryClient return a kubernetes discovery client for the current okteto context
 func GetDiscoveryClient() (discovery.DiscoveryInterface, *rest.Config, error) {
-	if Context().Cfg == nil {
+	if GetContext().Cfg == nil {
 		return nil, nil, fmt.Errorf("okteto context not initialized")
 	}
-	return getDiscoveryClient(Context().Cfg)
+	return getDiscoveryClient(GetContext().Cfg)
 }
 
 // GetSanitizedUsername returns the username of the authenticated user sanitized to be DNS compatible
 func GetSanitizedUsername() string {
-	octx := Context()
+	octx := GetContext()
 	return reg.ReplaceAllString(strings.ToLower(octx.Username), "-")
 }
 
-func (okctx *OktetoContext) ToUser() *types.User {
+func (okctx *Context) ToUser() *types.User {
 	u := &types.User{
 		ID:              okctx.UserID,
 		ExternalID:      okctx.Username,
@@ -406,16 +476,6 @@ func (okctx *OktetoContext) ToUser() *types.User {
 		Analytics:       okctx.Analytics,
 	}
 	return u
-}
-
-func IsOktetoCloud() bool {
-	octx := Context()
-	switch octx.Name {
-	case CloudURL, StagingURL:
-		return true
-	default:
-		return false
-	}
 }
 
 func RemoveSchema(uri string) string {
@@ -437,7 +497,7 @@ func AddSchema(oCtx string) string {
 	return oCtx
 }
 
-func (okctx *OktetoContext) SetClusterType(clusterHost string) {
+func (okctx *Context) SetClusterType(clusterHost string) {
 	if isLocalHostname(clusterHost) {
 		okctx.ClusterType = localClusterType
 	} else {
@@ -463,7 +523,7 @@ func isLocalHostname(clusterHost string) bool {
 }
 
 // ToViewer transforms to a viewer struct
-func (c *OktetoContext) ToViewer() *OktetoContextViewer {
+func (c *Context) ToViewer() *ContextViewer {
 	builder := c.Builder
 	if builder == "" {
 		builder = "docker"
@@ -472,11 +532,123 @@ func (c *OktetoContext) ToViewer() *OktetoContextViewer {
 	if builder == "" {
 		registry = "-"
 	}
-	return &OktetoContextViewer{
+	return &ContextViewer{
 		Name:      c.Name,
 		Namespace: c.Namespace,
 		Builder:   builder,
 		Registry:  registry,
-		Current:   Context().Name == c.Name,
+		Current:   GetContext().Name == c.Name,
 	}
+}
+
+// IsOktetoContext returns if the contextName param is Okteto
+func IsOktetoContext(contextName string) bool {
+	ctxStore := GetContextStore()
+	selectedCtx, ok := ctxStore.Contexts[contextName]
+	if !ok {
+		return false
+	}
+	return selectedCtx.IsOkteto
+}
+
+func GetSubdomain() string {
+	return strings.Replace(GetContext().Registry, "registry.", "", 1)
+}
+
+func GetContextCertificate() (*x509.Certificate, error) {
+	if !ContextExists() {
+		return nil, fmt.Errorf("okteto context not initialized")
+	}
+	certB64 := GetContext().Certificate
+	certPEM, err := base64.StdEncoding.DecodeString(certB64)
+
+	if err != nil {
+		oktetoLog.Debugf("couldn't decode context certificate from base64: %s", err)
+		return nil, err
+	}
+
+	block, _ := pem.Decode(certPEM)
+
+	if block == nil {
+		oktetoLog.Debugf("couldn't decode context certificate from pem: %s", err)
+		return nil, fmt.Errorf("couldn't decode pem")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+
+	if err != nil {
+		oktetoLog.Debugf("couldn't parse context certificate: %s", err)
+		return nil, err
+	}
+
+	if _, err := cert.Verify(x509.VerifyOptions{}); err != nil { // skipcq: GO-S1031
+		strictTLSOnce.Do(func() {
+			oktetoLog.Debugf("certificate issuer %s", cert.Issuer)
+			oktetoLog.Debugf("context certificate not trusted by system roots: %s", err)
+			if !GetContext().IsInsecure {
+				return
+			}
+			if cert.Issuer.CommonName == config.OktetoDefaultSelfSignedIssuer {
+				hoursSinceInstall := time.Since(cert.NotBefore).Hours()
+				switch {
+				case hoursSinceInstall <= hoursInADay: // less than 1 day
+					oktetoLog.Information("Your Okteto installation is using selfsigned certificates. Please switch to your own certificates before production use.")
+				case hoursSinceInstall <= hoursInAWeek: // less than 1 week
+					oktetoLog.Warning("Your Okteto installation has been using selfsigned certificates for more than a day. It's important to use your own certificates before production use.")
+				default: // more than 1 week
+					oktetoLog.Fail("[PLEASE READ] Your Okteto installation has been using selfsigned certificates for more than a week. It's important to use your own certificates before production use.")
+				}
+			}
+		})
+	}
+
+	return cert, nil
+}
+
+func GetContextCertificateStateless(certB64 string) (*x509.Certificate, error) {
+	certPEM, err := base64.StdEncoding.DecodeString(certB64)
+
+	if err != nil {
+		oktetoLog.Debugf("couldn't decode context certificate from base64: %s", err)
+		return nil, err
+	}
+
+	block, _ := pem.Decode(certPEM)
+
+	if block == nil {
+		oktetoLog.Debugf("couldn't decode context certificate from pem: %s", err)
+		return nil, fmt.Errorf("couldn't decode pem")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+
+	if err != nil {
+		oktetoLog.Debugf("couldn't parse context certificate: %s", err)
+		return nil, err
+	}
+
+	if _, err := cert.Verify(x509.VerifyOptions{}); err != nil { // skipcq: GO-S1031
+		strictTLSOnce.Do(func() {
+			oktetoLog.Debugf("certificate issuer %s", cert.Issuer)
+			oktetoLog.Debugf("context certificate not trusted by system roots: %s", err)
+			if !GetContext().IsInsecure {
+				return
+			}
+			if cert.Issuer.CommonName == config.OktetoDefaultSelfSignedIssuer {
+				hoursSinceInstall := time.Since(cert.NotBefore).Hours()
+				hoursInADay := 24
+				hoursInAWeek := 168
+				switch {
+				case hoursSinceInstall <= float64(hoursInADay): // less than 1 day
+					oktetoLog.Information("Your Okteto installation is using selfsigned certificates. Please switch to your own certificates before production use.")
+				case hoursSinceInstall <= float64(hoursInAWeek): // less than 1 week
+					oktetoLog.Warning("Your Okteto installation has been using selfsigned certificates for more than a day. It's important to use your own certificates before production use.")
+				default: // more than 1 week
+					oktetoLog.Fail("[PLEASE READ] Your Okteto installation has been using selfsigned certificates for more than a week. It's important to use your own certificates before production use.")
+				}
+			}
+		})
+	}
+
+	return cert, nil
 }

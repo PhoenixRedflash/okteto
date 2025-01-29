@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,9 +14,8 @@
 package test
 
 import (
-	"context"
-
 	"github.com/okteto/okteto/pkg/k8s/ingresses"
+	"github.com/okteto/okteto/pkg/log/io"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -25,8 +24,11 @@ import (
 )
 
 type FakeK8sProvider struct {
-	objects []runtime.Object
-	client  *fake.Clientset
+	errGetIngressClient error
+	ErrProvide          error
+	client              *fake.Clientset
+	restConfig          *rest.Config
+	objects             []runtime.Object
 }
 
 func NewFakeK8sProvider(objects ...runtime.Object) *FakeK8sProvider {
@@ -36,7 +38,10 @@ func NewFakeK8sProvider(objects ...runtime.Object) *FakeK8sProvider {
 	return &FakeK8sProvider{}
 }
 
-func (f *FakeK8sProvider) Provide(clientApiConfig *clientcmdapi.Config) (kubernetes.Interface, *rest.Config, error) {
+func (f *FakeK8sProvider) Provide(_ *clientcmdapi.Config) (kubernetes.Interface, *rest.Config, error) {
+	if f.ErrProvide != nil {
+		return nil, nil, f.ErrProvide
+	}
 	if f.client != nil {
 		return f.client, nil, nil
 	}
@@ -48,10 +53,18 @@ func (f *FakeK8sProvider) Provide(clientApiConfig *clientcmdapi.Config) (kuberne
 	}
 
 	f.client = c
-	return c, nil, nil
+	return c, f.restConfig, nil
 }
 
-func (f *FakeK8sProvider) GetIngressClient(_ context.Context) (*ingresses.Client, error) {
+func (f *FakeK8sProvider) ProvideWithLogger(c *clientcmdapi.Config, _ *io.K8sLogger) (kubernetes.Interface, *rest.Config, error) {
+	return f.Provide(c)
+}
+
+func (f *FakeK8sProvider) GetIngressClient() (*ingresses.Client, error) {
+	if f.errGetIngressClient != nil {
+		return nil, f.errGetIngressClient
+	}
+
 	c := fake.NewSimpleClientset(f.objects...)
 	return ingresses.NewIngressClient(c, true), nil
 }

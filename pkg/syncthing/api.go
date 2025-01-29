@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -30,8 +30,15 @@ type addAPIKeyTransport struct {
 	T http.RoundTripper
 }
 
+const (
+	APIKeyHeader      = "X-Api-Key"
+	APIKeyHeaderValue = "cnd"
+)
+
+// RoundTrip implements the http.RoundTripper interface and is used to add the
+// desired request headers to http requests.
 func (akt *addAPIKeyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Add("X-API-Key", "cnd")
+	req.Header.Add(APIKeyHeader, APIKeyHeaderValue)
 	return akt.T.RoundTrip(req)
 }
 
@@ -55,16 +62,17 @@ func (s *Syncthing) APICall(ctx context.Context, url, method string, code int, p
 				return result, nil
 			}
 
-			if retries >= maxRetries {
-				return nil, err
-			}
-			retries++
-
 			if strings.Contains(err.Error(), "connection refused") {
 				oktetoLog.Infof("syncthing is not ready, retrying local=%t", local)
 			} else {
 				oktetoLog.Infof("retrying syncthing call[%s] local=%t: %s", url, local, err.Error())
 			}
+
+			if retries >= maxRetries {
+				return nil, err
+			}
+			retries++
+
 		case <-ctx.Done():
 			oktetoLog.Infof("call to syncthing.APICall %s canceled", url)
 			return nil, ctx.Err()

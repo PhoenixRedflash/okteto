@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,6 +23,7 @@ import (
 )
 
 func downloadSyncthing() error {
+	maxRetries := 2
 	t := time.NewTicker(1 * time.Second)
 	var err error
 	for i := 0; i < 3; i++ {
@@ -32,7 +33,7 @@ func downloadSyncthing() error {
 			return nil
 		}
 
-		if i < 2 {
+		if i < maxRetries {
 			oktetoLog.Infof("failed to download syncthing, retrying: %s", err)
 			<-t.C
 		}
@@ -43,15 +44,14 @@ func downloadSyncthing() error {
 
 func sshKeys() error {
 	if !ssh.KeyExists() {
-		spinner := utils.NewSpinner("Generating your client certificates...")
-		spinner.Start()
+		oktetoLog.Spinner("Generating your client certificates...")
+		oktetoLog.StartSpinner()
+		defer oktetoLog.StopSpinner()
 
 		if err := ssh.GenerateKeys(); err != nil {
-			spinner.Stop()
 			return err
 		}
 
-		spinner.Stop()
 		oktetoLog.Success("Client certificates generated")
 	}
 

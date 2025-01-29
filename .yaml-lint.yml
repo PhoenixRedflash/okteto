@@ -1,0 +1,11 @@
+---
+# https://yamllint.readthedocs.io/en/stable/index.html
+# yamllint --strict -c .yaml-lint.yml .
+
+extends: default
+
+rules:
+  comments: disable
+  document-start: disable
+  line-length: disable
+  truthy: false

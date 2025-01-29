@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,9 +20,11 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/okteto/okteto/pkg/constants"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/filesystem"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	"github.com/okteto/okteto/pkg/model"
+	"github.com/spf13/afero"
 	"gopkg.in/yaml.v2"
 )
 
@@ -37,31 +39,36 @@ const (
 	contextsStoreFile       = "config.json"
 
 	oktetoFolderName = ".okteto"
-	//Activating up started
+	// Activating up started
 	Activating UpState = "activating"
-	//Starting up started the dev pod creation
+	// Starting up started the dev pod creation
 	Starting = "starting"
-	//Attaching up attaching volume
+	// Attaching up attaching volume
 	Attaching = "attaching"
-	//Pulling  up pulling images
+	// Pulling  up pulling images
 	Pulling = "pulling"
-	//Start ingSync up preparing syncthing
+	// StartingSync up preparing syncthing
 	StartingSync = "startingSync"
-	//Synchronize ing up is syncthing
+	// Synchronizing up is syncthing
 	Synchronizing = "synchronizing"
-	//Ready up fi nished
+	// Ready up finished
 	Ready = "ready"
-	//Fai led up failed
+	// Failed up failed
 	Failed = "failed"
 
 	stateFile string = "okteto.state"
 
-	//OktetoContextVariableName defines the kubeconfig context of okteto commands
+	// OktetoContextVariableName defines the kubeconfig context of okteto commands
 	OktetoContextVariableName = "OKTETO_CONTEXT"
+
+	// OktetoDefaultSelfSignedIssuer is the self signed CA issuer name used in helm chart installs
+	OktetoDefaultSelfSignedIssuer = "okteto-wildcard-ca"
 )
 
-// VersionString the version of the cli
-var VersionString string
+var (
+	// VersionString the version of the cli
+	VersionString string
+)
 
 // GetBinaryName returns the name of the binary
 func GetBinaryName() string {
@@ -73,24 +80,31 @@ func GetBinaryFullPath() string {
 	return os.Args[0]
 }
 
-// GetOktetoHome returns the path of the okteto folder
-func GetOktetoHome() string {
-	if v, ok := os.LookupEnv(model.OktetoFolderEnvVar); ok {
-		if !model.FileExists(v) {
+// GetOktetoHomeWithFilesystem returns the path of the okteto folder using the provided file system
+func GetOktetoHomeWithFilesystem(fs afero.Fs) string {
+	if v, ok := os.LookupEnv(constants.OktetoFolderEnvVar); ok {
+		if !filesystem.FileExistsWithFilesystem(v, fs) {
 			oktetoLog.Fatalf("OKTETO_FOLDER doesn't exist: %s", v)
 		}
 
 		return v
 	}
 
-	home := GetUserHomeDir()
+	home := GetUserHomeDirWithFilesystem(fs)
 	d := filepath.Join(home, oktetoFolderName)
 
-	if err := os.MkdirAll(d, 0700); err != nil {
+	filePerm := os.FileMode(0700)
+	if err := fs.MkdirAll(d, filePerm); err != nil {
 		oktetoLog.Fatalf("failed to create %s: %s", d, err)
 	}
 
 	return d
+}
+
+// GetOktetoHome returns the path of the okteto folder
+func GetOktetoHome() string {
+	fs := afero.NewOsFs()
+	return GetOktetoHomeWithFilesystem(fs)
 }
 
 // GetNamespaceHome returns the path of the folder
@@ -118,49 +132,52 @@ func GetAppHome(namespace, name string) string {
 }
 
 // UpdateStateFile updates the state file of a given dev environment
-func UpdateStateFile(dev *model.Dev, state UpState) error {
-	if dev.Namespace == "" {
+func UpdateStateFile(devName, devNamespace string, state UpState) error {
+	if devNamespace == "" {
 		return fmt.Errorf("can't update state file, namespace is empty")
 	}
 
-	if dev.Name == "" {
+	if devName == "" {
 		return fmt.Errorf("can't update state file, name is empty")
 	}
 
-	s := filepath.Join(GetAppHome(dev.Namespace, dev.Name), stateFile)
-	if err := os.WriteFile(s, []byte(state), 0644); err != nil {
-		return fmt.Errorf("failed to update state file: %s", err)
+	s := filepath.Join(GetAppHome(devNamespace, devName), stateFile)
+
+	oktetoLog.Infof("updating file '%s'", s)
+	if err := os.WriteFile(s, []byte(state), 0600); err != nil {
+		return fmt.Errorf("failed to update state file: %w", err)
 	}
+	oktetoLog.Infof("file '%s' updated successfully", s)
 
 	return nil
 }
 
 // DeleteStateFile deletes the state file of a given dev environment
-func DeleteStateFile(dev *model.Dev) error {
-	if dev.Namespace == "" {
+func DeleteStateFile(devName, devNamespace string) error {
+	if devNamespace == "" {
 		return fmt.Errorf("can't delete state file, namespace is empty")
 	}
 
-	if dev.Name == "" {
+	if devName == "" {
 		return fmt.Errorf("can't delete state file, name is empty")
 	}
 
-	s := filepath.Join(GetAppHome(dev.Namespace, dev.Name), stateFile)
+	s := filepath.Join(GetAppHome(devNamespace, devName), stateFile)
 	return os.Remove(s)
 }
 
 // GetState returns the state of a given dev environment
-func GetState(dev *model.Dev) (UpState, error) {
+func GetState(devName, devNamespace string) (UpState, error) {
 	var result UpState
-	if dev.Namespace == "" {
+	if devNamespace == "" {
 		return Failed, fmt.Errorf("can't update state file, namespace is empty")
 	}
 
-	if dev.Name == "" {
+	if devName == "" {
 		return Failed, fmt.Errorf("can't update state file, name is empty")
 	}
 
-	statePath := filepath.Join(GetAppHome(dev.Namespace, dev.Name), stateFile)
+	statePath := filepath.Join(GetAppHome(devNamespace, devName), stateFile)
 	stateBytes, err := os.ReadFile(statePath)
 	if err != nil {
 		oktetoLog.Infof("error reading state file: %s", err.Error())
@@ -177,10 +194,10 @@ func GetState(dev *model.Dev) (UpState, error) {
 	return result, nil
 }
 
-// GetUserHomeDir returns the OS home dir
-func GetUserHomeDir() string {
-	if v, ok := os.LookupEnv(model.OktetoHomeEnvVar); ok {
-		if !model.FileExists(v) {
+// GetUserHomeDirWithFilesystem returns the OS home dir using the provided file system
+func GetUserHomeDirWithFilesystem(fs afero.Fs) string {
+	if v, ok := os.LookupEnv(constants.OktetoHomeEnvVar); ok {
+		if !filesystem.FileExistsWithFilesystem(v, fs) {
 			oktetoLog.Fatalf("OKTETO_HOME points to a non-existing directory: %s", v)
 		}
 
@@ -196,21 +213,28 @@ func GetUserHomeDir() string {
 		return home
 	}
 
-	return os.Getenv(model.HomeEnvVar)
+	return os.Getenv(homeEnvVar)
 
 }
 
+// GetUserHomeDir returns the OS home dir
+func GetUserHomeDir() string {
+	fs := afero.NewOsFs()
+
+	return GetUserHomeDirWithFilesystem(fs)
+}
+
 func homedirWindows() (string, error) {
-	if home := os.Getenv(model.HomeEnvVar); home != "" {
+	if home := os.Getenv(homeEnvVar); home != "" {
 		return home, nil
 	}
 
-	if home := os.Getenv(model.UserProfileEnvVar); home != "" {
+	if home := os.Getenv(userProfileEnvVar); home != "" {
 		return home, nil
 	}
 
-	drive := os.Getenv(model.HomeDriveEnvVar)
-	path := os.Getenv(model.HomePathEnvVar)
+	drive := os.Getenv(homeDriveEnvVar)
+	path := os.Getenv(homePathEnvVar)
 	home := drive + path
 	if drive == "" || path == "" {
 		return "", fmt.Errorf("HOME, HOMEDRIVE, HOMEPATH, or USERPROFILE are empty. Use $OKTETO_HOME to set your home directory")
@@ -223,7 +247,7 @@ func homedirWindows() (string, error) {
 func GetKubeconfigPath() []string {
 	home := GetUserHomeDir()
 	kubeconfig := []string{filepath.Join(home, ".kube", "config")}
-	kubeconfigEnv := os.Getenv(model.KubeConfigEnvVar)
+	kubeconfigEnv := os.Getenv(constants.KubeConfigEnvVar)
 	if len(kubeconfigEnv) > 0 {
 		kubeconfig = splitKubeConfigEnv(kubeconfigEnv)
 	}
@@ -265,18 +289,18 @@ func GetCertificatePath() string {
 // GetDeployOrigin gets the pipeline deploy origin. This is the initiator of the
 // deploy action: web, cli, github-action, etc
 func GetDeployOrigin() (src string) {
-	src = os.Getenv(model.OktetoOriginEnvVar)
+	src = os.Getenv(oktetoOriginEnvVar)
 	if src == "" {
 		src = "cli"
 	}
 	// deploys within another okteto deploy take precedence as a deploy origin.
 	// This is running okteto pipeline deploy as a step of another okteto deploy
-	if os.Getenv(model.OktetoWithinDeployCommandContextEnvVar) == "true" {
+	if os.Getenv(constants.OktetoWithinDeployCommandContextEnvVar) == "true" {
 		src = "okteto-deploy"
 	}
 	return
 }
 
 func RunningInInstaller() bool {
-	return os.Getenv(model.OktetoInInstaller) == "true"
+	return os.Getenv(oktetoInInstaller) == "true"
 }

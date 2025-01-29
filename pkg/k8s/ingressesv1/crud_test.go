@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,7 +22,6 @@ import (
 	"testing"
 
 	networkingv1 "k8s.io/api/networking/v1"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -110,10 +109,10 @@ func TestList(t *testing.T) {
 
 func TestDestroy(t *testing.T) {
 	var tests = []struct {
+		ingress     *networkingv1.Ingress
 		name        string
 		ingressName string
 		namespace   string
-		ingress     *networkingv1.Ingress
 	}{
 		{
 			name:        "existent-ingress",
