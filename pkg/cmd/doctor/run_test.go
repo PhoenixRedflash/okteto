@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,14 +17,15 @@ import (
 	"os"
 	"testing"
 
+	"github.com/okteto/okteto/pkg/env"
 	"github.com/okteto/okteto/pkg/model"
 	"gopkg.in/yaml.v2"
 )
 
 func Test_generateManifestFile(t *testing.T) {
 	var tests = []struct {
-		name string
 		dev  *model.Dev
+		name string
 	}{
 		{
 			name: "empty",
@@ -34,7 +35,7 @@ func Test_generateManifestFile(t *testing.T) {
 			name: "basic",
 			dev: &model.Dev{
 				Name:    "dev",
-				Image:   &model.BuildInfo{Name: "okteto/dev"},
+				Image:   "okteto/dev",
 				Command: model.Command{Values: []string{"bash"}},
 			},
 		},
@@ -42,17 +43,17 @@ func Test_generateManifestFile(t *testing.T) {
 			name: "with-services",
 			dev: &model.Dev{
 				Name:    "dev",
-				Image:   &model.BuildInfo{Name: "okteto/dev"},
+				Image:   "okteto/dev",
 				Command: model.Command{Values: []string{"bash"}},
 				Services: []*model.Dev{{
 					Name:    "svc",
-					Image:   &model.BuildInfo{Name: "okteto/svc"},
+					Image:   "okteto/svc",
 					Command: model.Command{Values: []string{"bash"}},
 				}, {
 					Name:        "svc2",
-					Image:       nil,
+					Image:       "",
 					Command:     model.Command{Values: []string{"bash"}},
-					Environment: []model.EnvVar{{Name: "foo", Value: "bar"}},
+					Environment: []env.Var{{Name: "foo", Value: "bar"}},
 				}},
 			},
 		},

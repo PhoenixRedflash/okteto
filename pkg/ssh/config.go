@@ -1,6 +1,4 @@
-// based on https://github.com/havoc-io/ssh_config
-
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,6 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// based on https://github.com/havoc-io/ssh_config
 package ssh
 
 import (
@@ -87,9 +86,9 @@ func (h *host) String() string {
 
 }
 
-func newParam(keyword string, args, comments []string) *param {
+func newParam(keyword string, args []string) *param {
 	return &param{
-		comments: comments,
+		comments: nil,
 		keyword:  keyword,
 		args:     args,
 	}
@@ -232,7 +231,7 @@ func (config *sshConfig) writeToFilepath(p string) error {
 	var mode os.FileMode
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return fmt.Errorf("failed to get info on %s: %s", p, err)
+			return fmt.Errorf("failed to get info on %s: %w", p, err)
 		}
 
 		// default for ssh_config
@@ -244,7 +243,7 @@ func (config *sshConfig) writeToFilepath(p string) error {
 	dir := filepath.Dir(p)
 	temp, err := os.CreateTemp(dir, "")
 	if err != nil {
-		return fmt.Errorf("failed to create temporary config file: %s", err)
+		return fmt.Errorf("failed to create temporary config file: %w", err)
 	}
 
 	defer os.Remove(temp.Name())
@@ -258,15 +257,15 @@ func (config *sshConfig) writeToFilepath(p string) error {
 	}
 
 	if err := os.Chmod(temp.Name(), mode); err != nil {
-		return fmt.Errorf("failed to set permissions to %s: %s", temp.Name(), err)
+		return fmt.Errorf("failed to set permissions to %s: %w", temp.Name(), err)
 	}
 
 	if _, err := getConfig(temp.Name()); err != nil {
-		return fmt.Errorf("new config is not valid: %s", err)
+		return fmt.Errorf("new config is not valid: %w", err)
 	}
 
 	if err := os.Rename(temp.Name(), p); err != nil {
-		return fmt.Errorf("failed to move %s to %s: %s", temp.Name(), p, err)
+		return fmt.Errorf("failed to move %s to %s: %w", temp.Name(), p, err)
 	}
 
 	return nil

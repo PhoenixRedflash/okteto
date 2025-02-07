@@ -1,4 +1,4 @@
-// Copyright 2021 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,15 +23,22 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
 
+	giturls "github.com/chainguard-dev/git-urls"
+	"github.com/okteto/okteto/pkg/constants"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/format"
 	"github.com/okteto/okteto/pkg/k8s/apps"
 	"github.com/okteto/okteto/pkg/k8s/configmaps"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/types"
 	apiv1 "k8s.io/api/core/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -46,6 +53,9 @@ const (
 	iconField       = "icon"
 	actionLockField = "actionLock"
 	actionNameField = "actionName"
+	variablesField  = "variables"
+	devBranchField  = "dev-branch"
+	PhasesField     = "phases"
 
 	actionDefaultName = "cli"
 
@@ -64,6 +74,9 @@ const (
 	// Note that the is the limit after encoding the logs to base64 which is how
 	// the logs are stored in the configmap.
 	maxLogOutput = 800 << (10 * 1)
+
+	// ConfigmapNamePrefix prefix used by the configmaps created by okteto to handle dev environments information
+	ConfigmapNamePrefix = "okteto-git-"
 )
 
 // maxLogOutputRaw is the maximum size we allow to allocate for logs before
@@ -71,7 +84,7 @@ const (
 // See: https://stackoverflow.com/a/4715480/1100238
 var maxLogOutputRaw = int(math.Floor(float64(maxLogOutput)*3) / 4)
 
-//CfgData represents the data to be include in a configmap
+// CfgData represents the data to be include in a configmap
 type CfgData struct {
 	Name       string
 	Namespace  string
@@ -82,9 +95,30 @@ type CfgData struct {
 	Filename   string
 	Manifest   []byte
 	Icon       string
+	Variables  []string
 }
 
-// TranslateConfigMapAndDeploy translates the app into a configMap
+type phaseJSON struct {
+	Name     string  `json:"name"`
+	Duration float64 `json:"duration"`
+}
+
+// GetConfigmapVariablesEncoded returns Data["variables"] content from Configmap
+func GetConfigmapVariablesEncoded(ctx context.Context, name, namespace string, c kubernetes.Interface) (string, error) {
+	cmap, err := configmaps.Get(ctx, TranslatePipelineName(name), namespace, c)
+	if err != nil {
+		if !oktetoErrors.IsNotFound(err) {
+			return "", err
+		}
+		// if err Not Found, return empty variables but no error
+		return "", nil
+	}
+
+	return cmap.Data[variablesField], nil
+}
+
+// TranslateConfigMapAndDeploy translates the app into a configMap.
+// Name param is the pipeline sanitized name
 func TranslateConfigMapAndDeploy(ctx context.Context, data *CfgData, c kubernetes.Interface) (*apiv1.ConfigMap, error) {
 	cmap, err := configmaps.Get(ctx, TranslatePipelineName(data.Name), data.Namespace, c)
 	if err != nil {
@@ -113,12 +147,6 @@ func TranslateConfigMapAndDeploy(ctx context.Context, data *CfgData, c kubernete
 	return cmap, nil
 }
 
-// SetOutput sets the output of a config map
-func SetOutput(cfg *apiv1.ConfigMap, output string) *apiv1.ConfigMap {
-	cfg.Data[outputField] = base64.StdEncoding.EncodeToString([]byte(output))
-	return cfg
-}
-
 // UpdateConfigMap updates the configmaps fields
 func UpdateConfigMap(ctx context.Context, cmap *apiv1.ConfigMap, data *CfgData, c kubernetes.Interface) error {
 	cmap, err := configmaps.Get(ctx, cmap.Name, cmap.Namespace, c)
@@ -131,9 +159,93 @@ func UpdateConfigMap(ctx context.Context, cmap *apiv1.ConfigMap, data *CfgData, 
 	return configmaps.Deploy(ctx, cmap, cmap.Namespace, c)
 }
 
-// TranslatePipelineName translate the name into the pipeline name
+// UpdateEnvs updates the configmap adding the envs as data fields
+func UpdateEnvs(ctx context.Context, name, namespace string, envs []string, c kubernetes.Interface) error {
+	cmap, err := configmaps.Get(ctx, TranslatePipelineName(name), namespace, c)
+	if err != nil {
+		return err
+	}
+
+	if cmap != nil {
+		envsToSet := make(map[string]string, len(envs))
+		envFormatParts := 2
+		for _, env := range envs {
+			result := strings.SplitN(env, "=", envFormatParts)
+			if len(result) != envFormatParts {
+				return fmt.Errorf("invalid env format: '%s'", env)
+			}
+
+			envsToSet[result[0]] = result[1]
+		}
+
+		if len(envsToSet) > 0 {
+			encondedEnvs, err := json.Marshal(envsToSet)
+			if err != nil {
+				return err
+			}
+			cmap.Data[constants.OktetoDependencyEnvsKey] = base64.StdEncoding.EncodeToString(encondedEnvs)
+			return configmaps.Deploy(ctx, cmap, cmap.Namespace, c)
+		}
+
+	}
+	return nil
+}
+
+// AddPhaseDuration adds a new phase to the configmap with the duration in seconds
+func AddPhaseDuration(ctx context.Context, name, namespace, phase string, duration time.Duration, c kubernetes.Interface) error {
+	cmap, err := configmaps.Get(ctx, TranslatePipelineName(name), namespace, c)
+	if err != nil {
+		return err
+	}
+	val, ok := cmap.Data[PhasesField]
+	phases := []phaseJSON{}
+	if ok {
+		if err := json.Unmarshal([]byte(val), &phases); err != nil {
+			return err
+		}
+	}
+	// If the phase already exists, update the duration
+	updatedPhase := false
+	for idx, p := range phases {
+		if p.Name == phase {
+			phases[idx].Duration = duration.Seconds()
+			updatedPhase = true
+			break
+		}
+	}
+	// If the phase doesn't exist, add it
+	if !updatedPhase {
+		phases = append(phases, phaseJSON{
+			Name:     phase,
+			Duration: duration.Seconds(),
+		})
+	}
+	encodedPhases, err := json.Marshal(phases)
+	if err != nil {
+		return err
+	}
+	cmap.Data[PhasesField] = string(encodedPhases)
+	return configmaps.Deploy(ctx, cmap, cmap.Namespace, c)
+}
+
+// TranslatePipelineName translate the name into the configmap name
 func TranslatePipelineName(name string) string {
-	return fmt.Sprintf("okteto-git-%s", name)
+	return fmt.Sprintf("%s%s", ConfigmapNamePrefix, format.ResourceK8sMetaString(name))
+}
+
+// UpdateLatestUpBranch adds a new phase to the configmap with the duration in seconds
+func UpdateLatestUpBranch(ctx context.Context, name, namespace, branch string, c kubernetes.Interface) error {
+	cmap, err := configmaps.Get(ctx, TranslatePipelineName(name), namespace, c)
+	if err != nil {
+		return err
+	}
+	val := cmap.Data[devBranchField]
+	if val == branch {
+		oktetoLog.Infof("latestUpBranch already set to %s", branch)
+		return nil
+	}
+	cmap.Data[devBranchField] = branch
+	return configmaps.Deploy(ctx, cmap, cmap.Namespace, c)
 }
 
 func translateOutput(output *bytes.Buffer) []byte {
@@ -143,7 +255,7 @@ func translateOutput(output *bytes.Buffer) []byte {
 	var data []byte
 	if output.Len() > maxLogOutputRaw {
 		scanner := bufio.NewScanner(output)
-		linesInReverse := []string{}
+		var linesInReverse []string
 		for scanner.Scan() {
 			linesInReverse = append([]string{scanner.Text()}, linesInReverse...)
 		}
@@ -166,10 +278,17 @@ func translateOutput(output *bytes.Buffer) []byte {
 
 // translateConfigMapSandBox creates a configmap adding data from a config data
 func translateConfigMapSandBox(data *CfgData) *apiv1.ConfigMap {
+	// if repository is empty, force empty branch
+	if data.Repository == "" {
+		data.Branch = ""
+	}
 	cmap := &apiv1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: data.Namespace,
-			Name:      TranslatePipelineName(data.Name),
+			Name:      TranslatePipelineName(format.ResourceK8sMetaString(data.Name)),
+			Annotations: map[string]string{
+				constants.LastUpdatedAnnotation: time.Now().UTC().Format(constants.TimeFormat),
+			},
 			Labels: map[string]string{
 				model.GitDeployLabel: "true",
 			},
@@ -179,26 +298,33 @@ func translateConfigMapSandBox(data *CfgData) *apiv1.ConfigMap {
 			statusField:   data.Status,
 			repoField:     data.Repository,
 			branchField:   data.Branch,
-			filenameField: data.Filename,
+			filenameField: "",
 			yamlField:     base64.StdEncoding.EncodeToString(data.Manifest),
 			iconField:     data.Icon,
 		},
 	}
-	if data.Repository != "" {
-		cmap.Data[repoField] = data.Repository
+
+	// only include field when variables exist
+	if len(data.Variables) > 0 {
+		cmap.Data[variablesField] = translateVariables(data.Variables)
 	}
 
-	if data.Branch != "" {
-		cmap.Data[branchField] = data.Branch
+	if data.Repository != "" {
+		cmap.Data[filenameField] = data.Filename
 	}
 
 	output := oktetoLog.GetOutputBuffer()
 	outputData := translateOutput(output)
-	cmap.Data[outputField] = base64.StdEncoding.EncodeToString([]byte(outputData))
+	cmap.Data[outputField] = base64.StdEncoding.EncodeToString(outputData)
 	return cmap
 }
 
 func updateCmap(cmap *apiv1.ConfigMap, data *CfgData) error {
+	if cmap.Annotations == nil {
+		cmap.Annotations = map[string]string{}
+	}
+	cmap.Annotations[constants.LastUpdatedAnnotation] = time.Now().UTC().Format(constants.TimeFormat)
+
 	actionName := os.Getenv(model.OktetoActionNameEnvVar)
 	if actionName == "" {
 		actionName = actionDefaultName
@@ -209,21 +335,37 @@ func updateCmap(cmap *apiv1.ConfigMap, data *CfgData) error {
 	cmap.ObjectMeta.Labels[model.GitDeployLabel] = "true"
 	cmap.Data[nameField] = data.Name
 	cmap.Data[statusField] = data.Status
-	cmap.Data[filenameField] = data.Filename
 	cmap.Data[yamlField] = base64.StdEncoding.EncodeToString(data.Manifest)
 	cmap.Data[iconField] = data.Icon
 	cmap.Data[actionNameField] = actionName
 	if data.Repository != "" {
+		// the filename at the cfgmap is used by the installer to re-deploy the app from the ui
+		// this parameter is just saved if a repository is being detected
+		// when repository is empty - the filename should not be saved and redeploys should be done from cli
+		cmap.Data[filenameField] = data.Filename
 		cmap.Data[repoField] = data.Repository
+	}
+
+	// if repository is empty, force empty branch
+	if data.Repository == "" {
+		data.Branch = ""
 	}
 
 	if data.Branch != "" {
 		cmap.Data[branchField] = data.Branch
 	}
 
+	// only update field when variables exist
+	if len(data.Variables) > 0 {
+		cmap.Data[variablesField] = translateVariables(data.Variables)
+	} else {
+		// if data.Variables is empty, update cmap by removing the field
+		delete(cmap.Data, variablesField)
+	}
+
 	output := oktetoLog.GetOutputBuffer()
 	outputData := translateOutput(output)
-	cmap.Data[outputField] = base64.StdEncoding.EncodeToString([]byte(outputData))
+	cmap.Data[outputField] = base64.StdEncoding.EncodeToString(outputData)
 	return nil
 }
 
@@ -234,17 +376,70 @@ func AddDevAnnotations(ctx context.Context, manifest *model.Manifest, c kubernet
 		if dev.Autocreate {
 			continue
 		}
-		app, err := apps.Get(ctx, dev, manifest.Namespace, c)
+		ns := okteto.GetContext().Namespace
+		app, err := apps.Get(ctx, dev, ns, c)
 		if err != nil {
 			oktetoLog.Infof("could not add %s dev annotations due to: %s", devName, err.Error())
 			continue
 		}
+		sanitisedRepo := removeSensitiveDataFromGitURL(repo)
+		repositoryAnnotation := app.ObjectMeta().Annotations[model.OktetoRepositoryAnnotation]
+		devNameAnnotation := app.ObjectMeta().Annotations[model.OktetoDevNameAnnotation]
+
+		if repo != "" && repositoryAnnotation == sanitisedRepo {
+			continue
+		}
+		if devNameAnnotation != "" {
+			continue
+		}
+
 		if repo != "" {
-			app.ObjectMeta().Annotations[model.OktetoRepositoryAnnotation] = repo
+			app.ObjectMeta().Annotations[model.OktetoRepositoryAnnotation] = sanitisedRepo
 		}
 		app.ObjectMeta().Annotations[model.OktetoDevNameAnnotation] = devName
 		if err := app.PatchAnnotations(ctx, c); err != nil {
 			oktetoLog.Infof("could not add %s dev annotations due to: %s", devName, err.Error())
 		}
 	}
+}
+
+func removeSensitiveDataFromGitURL(gitURL string) string {
+	if gitURL == "" {
+		return gitURL
+	}
+
+	parsedRepo, err := giturls.Parse(gitURL)
+	if err != nil {
+		return ""
+	}
+
+	if parsedRepo.User.Username() != "" {
+		parsedRepo.User = nil
+	}
+	return parsedRepo.String()
+}
+
+func translateVariables(variables []string) string {
+	var v []types.DeployVariable
+	maxVariableFormatParts := 2
+	for _, item := range variables {
+		splitV := strings.SplitN(item, "=", maxVariableFormatParts)
+		if len(splitV) != maxVariableFormatParts {
+			continue
+		}
+		v = append(v, types.DeployVariable{
+			Name:  splitV[0],
+			Value: splitV[1],
+		})
+	}
+
+	if len(v) > 0 {
+		encodedVars, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return base64.StdEncoding.EncodeToString(encodedVars)
+	}
+
+	return ""
 }

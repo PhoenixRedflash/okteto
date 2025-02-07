@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,20 +15,16 @@ package okteto
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"os"
-	"regexp"
-	"strings"
+	"errors"
 
-	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/constants"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/types"
 	"github.com/shurcooL/graphql"
 )
 
-var reg = regexp.MustCompile("[^A-Za-z0-9]+")
+const cliSource = "cli"
 
 // Token contains the auth token and the URL it belongs to
 type Token struct {
@@ -41,73 +37,102 @@ type Token struct {
 	MachineID string `json:"MachineID"`
 }
 
-// Auth authenticates in okteto with an OAuth code
-func Auth(ctx context.Context, code, url string) (*types.User, error) {
-	oktetoClient, err := NewOktetoClientFromUrl(url)
-	if err != nil {
-		return nil, err
-	}
+type authenticationErr struct {
+	E error
+}
 
-	user, err := oktetoClient.authUser(ctx, code)
+func (*authenticationErr) Error() string {
+	return "authentication error, please try again"
+}
+func (e *authenticationErr) Unwrap() error {
+	return e.E
+}
+
+func newAuthenticationErr(err error) *authenticationErr {
+	return &authenticationErr{
+		E: err,
+	}
+}
+
+var errGitHubNotVerifiedEmail = errors.New("your GitHub account doesn't have a verified primary email address. Please check your GitHub account email settings and try again")
+
+type authMutationStruct struct {
+	Response userMutation `graphql:"auth(code: $code, source: $source)"`
+}
+
+type userMutation struct {
+	Id              graphql.String
+	Name            graphql.String
+	Namespace       graphql.String
+	Email           graphql.String
+	ExternalID      graphql.String `graphql:"externalID"`
+	Token           graphql.String
+	Registry        graphql.String
+	Buildkit        graphql.String
+	Certificate     graphql.String
+	GlobalNamespace graphql.String `graphql:"globalNamespace"`
+	New             graphql.Boolean
+	Analytics       graphql.Boolean `graphql:"telemetryEnabled"`
+}
+
+// Auth authenticates in okteto with an OAuth code
+func (c *Client) Auth(ctx context.Context, code string) (*types.User, error) {
+	user, err := c.authUser(ctx, code)
 	if err != nil {
 		oktetoLog.Infof("authentication error: %s", err)
 		if oktetoErrors.IsErrGitHubNotVerifiedEmail(err) {
-			return nil, fmt.Errorf("Your GitHub account doesn't have a verified primary email address. Please check your GitHub account email settings and try again")
+			return nil, errGitHubNotVerifiedEmail
 		}
-		return nil, fmt.Errorf("authentication error, please try again")
+		// This error is sent at the mutation with Metadata. Our current client for GraphQL does not support this kind of errors,
+		// so the information regarding metadata is lost here. Message is still communicated, so we can check the error
+		// https://github.com/okteto/okteto/issues/2926
+		if IsErrGithubMissingBusinessEmail(err) {
+			return nil, err
+		}
+
+		// If there is a TLS error, return the raw error
+		if err != nil && oktetoErrors.IsX509(err) {
+			return nil, err
+		}
+
+		if isAPILicenseError(err) {
+			return nil, err
+		}
+
+		err := newAuthenticationErr(err)
+		return nil, err
 	}
 
 	return user, nil
 }
 
-func (c *OktetoClient) authUser(ctx context.Context, code string) (*types.User, error) {
-	var mutation struct {
-		User struct {
-			Id              graphql.String
-			Name            graphql.String
-			Namespace       graphql.String
-			Email           graphql.String
-			ExternalID      graphql.String `graphql:"externalID"`
-			Token           graphql.String
-			New             graphql.Boolean
-			Registry        graphql.String
-			Buildkit        graphql.String
-			Certificate     graphql.String
-			GlobalNamespace graphql.String  `graphql:"globalNamespace"`
-			Analytics       graphql.Boolean `graphql:"telemetryEnabled"`
-		} `graphql:"auth(code: $code, source: $source)"`
-	}
+func (c *Client) authUser(ctx context.Context, code string) (*types.User, error) {
+	var mutation authMutationStruct
 
 	queryVariables := map[string]interface{}{
 		"code":   graphql.String(code),
-		"source": graphql.String("cli"),
+		"source": graphql.String(cliSource),
 	}
 
 	err := mutate(ctx, &mutation, queryVariables, c.client)
 	if err != nil {
-		if strings.Contains(err.Error(), "Cannot query field \"globalNamespace\" on type \"me\"") {
-			return c.deprecatedAuthUser(ctx, code)
-		}
-		if strings.Contains(err.Error(), "Cannot query field \"telemetryEnabled\" on type \"me\"") {
-			return c.deprecatedAuthUser(ctx, code)
-		}
 		return nil, err
 	}
 
-	globalNamespace := getGlobalNamespace(string(mutation.User.GlobalNamespace))
-	analytics := bool(mutation.User.Analytics)
+	globalNamespace := getGlobalNamespace(string(mutation.Response.GlobalNamespace))
+	analytics := bool(mutation.Response.Analytics)
 
 	user := &types.User{
-		ID:              string(mutation.User.Id),
-		Name:            string(mutation.User.Name),
-		Namespace:       string(mutation.User.Namespace),
-		Email:           string(mutation.User.Email),
-		ExternalID:      string(mutation.User.ExternalID),
-		Token:           string(mutation.User.Token),
-		New:             bool(mutation.User.New),
-		Registry:        string(mutation.User.Registry),
-		Buildkit:        string(mutation.User.Buildkit),
-		Certificate:     string(mutation.User.Certificate),
+		ID:              string(mutation.Response.Id),
+		Name:            string(mutation.Response.Name),
+		Namespace:       string(mutation.Response.Namespace),
+		Email:           string(mutation.Response.Email),
+		ExternalID:      string(mutation.Response.ExternalID),
+		Token:           string(mutation.Response.Token),
+		New:             bool(mutation.Response.New),
+		Registry:        string(mutation.Response.Registry),
+		Buildkit:        string(mutation.Response.Buildkit),
+		Certificate:     string(mutation.Response.Certificate),
 		GlobalNamespace: globalNamespace,
 		Analytics:       analytics,
 	}
@@ -115,69 +140,9 @@ func (c *OktetoClient) authUser(ctx context.Context, code string) (*types.User, 
 	return user, nil
 }
 
-func (c *OktetoClient) deprecatedAuthUser(ctx context.Context, code string) (*types.User, error) {
-	var mutation struct {
-		User struct {
-			Id          graphql.String
-			Name        graphql.String
-			Namespace   graphql.String
-			Email       graphql.String
-			ExternalID  graphql.String `graphql:"externalID"`
-			Token       graphql.String
-			New         graphql.Boolean
-			Registry    graphql.String
-			Buildkit    graphql.String
-			Certificate graphql.String
-		} `graphql:"auth(code: $code, source: $source)"`
-	}
-
-	queryVariables := map[string]interface{}{
-		"code":   graphql.String(code),
-		"source": graphql.String("cli"),
-	}
-
-	err := mutate(ctx, &mutation, queryVariables, c.client)
-	if err != nil {
-		return nil, err
-	}
-
-	user := &types.User{
-		ID:              string(mutation.User.Id),
-		Name:            string(mutation.User.Name),
-		Namespace:       string(mutation.User.Namespace),
-		Email:           string(mutation.User.Email),
-		ExternalID:      string(mutation.User.ExternalID),
-		Token:           string(mutation.User.Token),
-		New:             bool(mutation.User.New),
-		Registry:        string(mutation.User.Registry),
-		Buildkit:        string(mutation.User.Buildkit),
-		Certificate:     string(mutation.User.Certificate),
-		GlobalNamespace: DefaultGlobalNamespace,
-		Analytics:       true,
-	}
-
-	return user, nil
-}
-
-func getTokenFromOktetoHome() (*Token, error) {
-	p := config.GetTokenPathDeprecated()
-
-	b, err := os.ReadFile(p)
-	if err != nil {
-		return nil, err
-	}
-
-	currentToken := &Token{}
-	if err := json.Unmarshal(b, currentToken); err != nil {
-		return nil, err
-	}
-
-	return currentToken, nil
-}
-
 func getGlobalNamespace(g string) string {
 	if g == "" {
-		return DefaultGlobalNamespace
+		return constants.DefaultGlobalNamespace
 	}
 	return g
 }

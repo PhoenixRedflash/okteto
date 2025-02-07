@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,13 +20,13 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-//PlainWriter writes into a plain terminal
+// PlainWriter writes into a plain terminal
 type PlainWriter struct {
 	out  *logrus.Logger
 	file *logrus.Entry
 }
 
-//newPlainWriter creates a new plainWriter
+// newPlainWriter creates a new plainWriter
 func newPlainWriter(out *logrus.Logger, file *logrus.Entry) *PlainWriter {
 	return &PlainWriter{
 		out:  out,
@@ -205,12 +205,12 @@ func (w *PlainWriter) Print(args ...interface{}) {
 	}
 }
 
-//Printf writes a line with format
+// Printf writes a line with format
 func (w *PlainWriter) Printf(format string, a ...interface{}) {
 	w.Fprintf(w.out.Out, format, a...)
 }
 
-//IsInteractive checks if the writer is interactive
+// IsInteractive checks if the writer is interactive
 func (*PlainWriter) IsInteractive() bool {
 	return false
 }
@@ -227,7 +227,7 @@ func (*PlainWriter) AddToBuffer(level, format string, a ...interface{}) {
 	}
 }
 
-// AddToBuffer logs into the buffer but does not print anything
+// Write logs into the buffer but does not print anything
 func (w *PlainWriter) Write(p []byte) (n int, err error) {
 	return w.out.Out.Write(p)
 }

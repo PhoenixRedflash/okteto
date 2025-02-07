@@ -1,18 +1,31 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package model
 
 import (
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func Test_ExpandStackEnvs(t *testing.T) {
+	t.Setenv("ENV2", "bye")
 	tests := []struct {
 		name          string
-		file          []byte
 		envValue      string
 		expectedStack string
+		file          []byte
 		expectedError bool
 	}{
 		{
@@ -22,19 +35,22 @@ services:
     myservice:
         build:
             context: vote
-        args:
-            - $CUSTOM_ENV
-            - CUSTOM2_ENV=$CUSTOM_ENV
-            - EMPTY
+            args:
+                - ENV=hello
+                - CUSTOM2_ENV=$CUSTOM_ENV
+                - EMPTY=
+                - ENV2=
         ports:
             - 8080:8080
         environment:
             FLASK_ENV: development
             CUSTOM_ENV: $CUSTOM_ENV
-            $CUSTOM2_ENV:
-            EMPTY:
+            ENV:
         volumes:
             - ./vote:/src
+            - $CUSTOM_ENV:/src
+            - ${CUSTOM_ENV}:/src
+            - ${ENV:-dev}:/src
 
     redis:
         image: redis
@@ -50,19 +66,22 @@ volumes:
   myservice:
     build:
       context: vote
-    args:
-      - CUSTOM_ENV=MYVALUE
-      - CUSTOM2_ENV=MYVALUE
-      - EMPTY
+      args:
+        - ENV=hello
+        - CUSTOM2_ENV=MYVALUE
+        - EMPTY=
+        - ENV2=
     ports:
       - 8080:8080
     environment:
       FLASK_ENV: development
       CUSTOM_ENV: MYVALUE
-      CUSTOM2_ENV:
-      EMPTY:
+      ENV:
     volumes:
       - ./vote:/src
+      - MYVALUE:/src
+      - MYVALUE:/src
+      - dev:/src
   redis:
     image: redis
     ports:
@@ -81,15 +100,14 @@ services:
     myservice:
         build:
             context: vote
-        args:
-            - $CUSTOM_ENV
-            - CUSTOM2_ENV=$CUSTOM_ENV
+            args:
+                - CUSTOM2_ENV=$CUSTOM_ENV
         ports:
             - 8080:8080
         environment:
             FLASK_ENV: development
             CUSTOM_ENV: $CUSTOM_ENV
-            $CUSTOM2_ENV:
+            CUSTOM2_ENV:
         volumes:
             - ./myservice:/src
 
@@ -107,13 +125,10 @@ volumes:
   myservice:
     build:
       context: vote
-    args:
-      - |-
-        CUSTOM_ENV=my first line
-        my second line
-      - |-
-        CUSTOM2_ENV=my first line
-        my second line
+      args:
+        - |-
+          CUSTOM2_ENV=my first line
+          my second line
     ports:
       - 8080:8080
     environment:
@@ -140,9 +155,7 @@ volumes:
 	for _, tt := range tests {
 
 		t.Run(tt.name, func(t *testing.T) {
-			if err := os.Setenv("CUSTOM_ENV", tt.envValue); err != nil {
-				t.Fatal(err)
-			}
+			t.Setenv("CUSTOM_ENV", tt.envValue)
 			result, err := ExpandStackEnvs(tt.file)
 			if err != nil && !tt.expectedError {
 				t.Fatalf("expected no error, but got error: %v", err)
@@ -152,7 +165,6 @@ volumes:
 
 			assert.Equal(t, tt.expectedStack, string(result))
 
-			os.Unsetenv("CUSTOM_ENV")
 		})
 	}
 }

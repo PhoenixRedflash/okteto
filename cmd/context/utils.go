@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,20 +14,14 @@
 package context
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
-	"github.com/okteto/okteto/cmd/utils"
 	"github.com/okteto/okteto/pkg/config"
-	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/constants"
 	"github.com/okteto/okteto/pkg/k8s/kubeconfig"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	"github.com/okteto/okteto/pkg/model"
-	"github.com/okteto/okteto/pkg/okteto"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 type SelectItem struct {
@@ -36,10 +30,8 @@ type SelectItem struct {
 }
 
 type ManifestOptions struct {
-	Name       string
-	Namespace  string
-	Filename   string
-	K8sContext string
+	Name     string
+	Filename string
 }
 
 func getKubernetesContextList(filterOkteto bool) []string {
@@ -56,7 +48,7 @@ func getKubernetesContextList(filterOkteto bool) []string {
 		return contextList
 	}
 	for name := range cfg.Contexts {
-		if _, ok := cfg.Contexts[name].Extensions[model.OktetoExtension]; ok && filterOkteto {
+		if _, ok := cfg.Contexts[name].Extensions[constants.OktetoExtension]; ok && filterOkteto {
 			continue
 		}
 		contextList = append(contextList, name)
@@ -80,20 +72,17 @@ func isCreateNewContextOption(option string) bool {
 	return option == newOEOption
 }
 
-func askForOktetoURL() (string, error) {
-	clusterURL := okteto.CloudURL
-	ctxStore := okteto.ContextStore()
-	if oCtx, ok := ctxStore.Contexts[ctxStore.CurrentContext]; ok && oCtx.IsOkteto {
-		clusterURL = ctxStore.CurrentContext
-	}
-
-	err := oktetoLog.Question("Enter your Okteto URL [%s]: ", clusterURL)
+func askForOktetoURL(message string) (string, error) {
+	err := oktetoLog.Question(message)
 	if err != nil {
 		return "", err
 	}
-	fmt.Scanln(&clusterURL)
+	var oktetoURL string
+	if _, err := fmt.Scanln(&oktetoURL); err != nil {
+		return "", err
+	}
 
-	url, err := url.Parse(clusterURL)
+	url, err := url.Parse(oktetoURL)
 	if err != nil {
 		return "", nil
 	}
@@ -110,149 +99,4 @@ func isValidCluster(cluster string) bool {
 		}
 	}
 	return false
-}
-
-func addKubernetesContext(cfg *clientcmdapi.Config, ctxResource *model.ContextResource) error {
-	if cfg == nil {
-		return fmt.Errorf(oktetoErrors.ErrKubernetesContextNotFound, ctxResource.Context, config.GetKubeconfigPath())
-	}
-	if _, ok := cfg.Contexts[ctxResource.Context]; !ok {
-		return fmt.Errorf(oktetoErrors.ErrKubernetesContextNotFound, ctxResource.Context, config.GetKubeconfigPath())
-	}
-	if ctxResource.Namespace == "" {
-		ctxResource.Namespace = cfg.Contexts[ctxResource.Context].Namespace
-	}
-	if ctxResource.Namespace == "" {
-		ctxResource.Namespace = "default"
-	}
-	okteto.AddKubernetesContext(ctxResource.Context, ctxResource.Namespace, "")
-	return nil
-}
-
-func LoadManifestWithContext(ctx context.Context, opts ManifestOptions) (*model.Manifest, error) {
-
-	var manifest *model.Manifest
-	manifest, err := model.GetManifestV1(opts.Filename)
-	if err != nil {
-		if !errors.Is(err, oktetoErrors.ErrManifestNotFound) {
-			return nil, err
-		}
-		manifest, err = model.GetManifestV2(opts.Filename)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	ctxResource := model.GetContextResourceFromManifest(manifest)
-	if err := ctxResource.UpdateNamespace(opts.Namespace); err != nil {
-		return nil, err
-	}
-
-	if err := ctxResource.UpdateContext(opts.K8sContext); err != nil {
-		return nil, err
-	}
-
-	ctxOptions := &ContextOptions{
-		Context:   ctxResource.Context,
-		Namespace: ctxResource.Namespace,
-		Show:      true,
-	}
-
-	if err := NewContextCommand().Run(ctx, ctxOptions); err != nil {
-		return nil, err
-	}
-
-	// We need to read it again to propagate secrets env vars
-	if manifest.IsV2 {
-		manifest, err = model.GetManifestV2(opts.Filename)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		manifest, err = model.GetManifestV1(opts.Filename)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	manifest.Namespace = okteto.Context().Namespace
-	manifest.Context = okteto.Context().Name
-
-	for _, dev := range manifest.Dev {
-		if err := utils.LoadManifestRc(dev); err != nil {
-			return nil, err
-		}
-
-		dev.Namespace = okteto.Context().Namespace
-		dev.Context = okteto.Context().Name
-	}
-
-	return manifest, nil
-}
-
-func LoadStackWithContext(ctx context.Context, name, namespace string, stackPaths []string) (*model.Stack, error) {
-	ctxResource, err := utils.LoadStackContext(stackPaths)
-	if err != nil {
-		if name == "" {
-			return nil, err
-		}
-		ctxResource = &model.ContextResource{}
-	}
-
-	if err := ctxResource.UpdateNamespace(namespace); err != nil {
-		return nil, err
-	}
-
-	ctxOptions := &ContextOptions{
-		Context:   ctxResource.Context,
-		Namespace: ctxResource.Namespace,
-		Show:      true,
-	}
-
-	if err := NewContextCommand().Run(ctx, ctxOptions); err != nil {
-		return nil, err
-	}
-
-	s, err := model.LoadStack(name, stackPaths, true)
-	if err != nil {
-		if name == "" {
-			return nil, err
-		}
-		s = &model.Stack{Name: name}
-	}
-	s.Namespace = okteto.Context().Namespace
-	return s, nil
-}
-
-//LoadManifestV2WithContext initializes the okteto context taking into account command flags and manifest namespace/context fields
-func LoadManifestV2WithContext(ctx context.Context, namespace, k8sContext, path string) error {
-	ctxOptions := &ContextOptions{
-		Namespace: namespace,
-		Show:      true,
-	}
-
-	manifest, err := model.GetManifestV2(path)
-	if err != nil {
-		if err != oktetoErrors.ErrManifestNotFound {
-			return err
-		}
-	} else {
-		ctxResource := model.GetContextResourceFromManifest(manifest)
-
-		if err := ctxResource.UpdateNamespace(namespace); err != nil {
-			return err
-		}
-
-		if err := ctxResource.UpdateContext(k8sContext); err != nil {
-			return err
-		}
-
-		ctxOptions = &ContextOptions{
-			Context:   ctxResource.Context,
-			Namespace: ctxResource.Namespace,
-			Show:      true,
-		}
-	}
-
-	return NewContextCommand().Run(ctx, ctxOptions)
 }

@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,23 +14,28 @@
 package executor
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/env"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 )
 
-//ManifestExecutor is the interface to execute a command
+// ManifestExecutor is the interface to execute a command
 type ManifestExecutor interface {
 	Execute(command model.DeployCommand, env []string) error
 	CleanUp(err error)
 }
 
-//Executor implements ManifestExecutor with a executor displayer
+// Executor implements ManifestExecutor with a executor displayer
 type Executor struct {
-	outputMode string
-	displayer  executorDisplayer
+	displayer      executorDisplayer
+	outputMode     string
+	shell, dir     string
+	runWithoutBash bool
 }
 
 type executorDisplayer interface {
@@ -40,8 +45,9 @@ type executorDisplayer interface {
 }
 
 // NewExecutor returns a new executor
-func NewExecutor(output string) *Executor {
+func NewExecutor(output string, runWithoutBash bool, dir string) *Executor {
 	var displayer executorDisplayer
+
 	switch output {
 	case oktetoLog.TTYFormat:
 		displayer = newTTYExecutor()
@@ -52,18 +58,40 @@ func NewExecutor(output string) *Executor {
 	default:
 		displayer = newTTYExecutor()
 	}
+
+	shell := "bash"
+	if env.LoadBoolean(constants.OktetoDeployRemote) {
+		shell = "sh"
+	}
+
 	return &Executor{
-		outputMode: output,
-		displayer:  displayer,
+		outputMode:     output,
+		displayer:      displayer,
+		runWithoutBash: runWithoutBash,
+		shell:          shell,
+		dir:            dir,
 	}
 }
 
 // Execute executes the specified command adding `env` to the execution environment
 func (e *Executor) Execute(cmdInfo model.DeployCommand, env []string) error {
 
-	cmd := exec.Command("bash", "-c", cmdInfo.Command)
+	cmd := exec.Command(e.shell, "-c", cmdInfo.Command)
+	if e.runWithoutBash {
+		cmd = exec.Command(cmdInfo.Command)
+	}
 	cmd.Env = append(os.Environ(), env...)
+
+	if e.dir != "" {
+		cmd.Dir = e.dir
+	}
+
 	if err := e.displayer.startCommand(cmd); err != nil {
+		if execErr, ok := err.(*exec.Error); ok {
+			if execErr != nil && execErr.Name == e.shell {
+				return fmt.Errorf("%w: \"%s\" is a required dependency for executing the command", err, e.shell)
+			}
+		}
 		return err
 	}
 

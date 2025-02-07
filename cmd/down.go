@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,28 +15,32 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"os/signal"
 
 	contextCMD "github.com/okteto/okteto/cmd/context"
 	"github.com/okteto/okteto/cmd/utils"
-	"github.com/okteto/okteto/pkg/analytics"
 	"github.com/okteto/okteto/pkg/cmd/down"
 	"github.com/okteto/okteto/pkg/config"
-	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/filesystem"
 	"github.com/okteto/okteto/pkg/k8s/apps"
-	"github.com/okteto/okteto/pkg/k8s/deployments"
-	"github.com/okteto/okteto/pkg/k8s/volumes"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/log/io"
 	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/okteto"
-	"github.com/okteto/okteto/pkg/syncthing"
+	"github.com/okteto/okteto/pkg/validator"
+	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
 
+type analyticsTrackerInterface interface {
+	TrackDown(bool)
+	TrackDownVolumes(bool)
+}
+
 // Down deactivates the development container
-func Down() *cobra.Command {
+func Down(at analyticsTrackerInterface, k8sLogsCtrl *io.K8sLogger, fs afero.Fs) *cobra.Command {
 	var devPath string
 	var namespace string
 	var k8sContext string
@@ -44,164 +48,112 @@ func Down() *cobra.Command {
 	var all bool
 
 	cmd := &cobra.Command{
-		Use:   "down [svc]",
-		Short: "Deactivate your development container",
-		Args:  utils.MaximumNArgsAccepted(1, "https://okteto.com/docs/reference/cli/#down"),
+		Use:   "down [devContainer]",
+		Short: "Deactivate your Development Container, stops the file synchronization service, and restores your previous deployment configuration",
+		Args:  utils.MaximumNArgsAccepted(1, "https://okteto.com/docs/reference/okteto-cli/#down"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 
-			manifestOpts := contextCMD.ManifestOptions{Filename: devPath, Namespace: namespace, K8sContext: k8sContext}
+			ctxOpts := &contextCMD.Options{
+				Show:      true,
+				Context:   k8sContext,
+				Namespace: namespace,
+			}
+			if err := contextCMD.NewContextCommand().Run(ctx, ctxOpts); err != nil {
+				return err
+			}
+
+			manifestOpts := contextCMD.ManifestOptions{
+				Filename: devPath,
+			}
 			if devPath != "" {
-				workdir := model.GetWorkdirFromManifestPath(devPath)
+				workdir := filesystem.GetWorkdirFromManifestPath(devPath)
 				if err := os.Chdir(workdir); err != nil {
 					return err
 				}
-				devPath = model.GetManifestPathFromWorkdir(devPath, workdir)
-			}
-			manifest, err := contextCMD.LoadManifestWithContext(ctx, manifestOpts)
-			if err != nil {
-				return err
-			}
 
-			if all {
-				err := allDown(ctx, manifest, rm)
-				if err != nil {
+				devPath = filesystem.GetManifestPathFromWorkdir(devPath, workdir)
+				if err := validator.FileArgumentIsNotDir(fs, devPath); err != nil {
 					return err
 				}
 			}
-
-			devName := ""
-			if len(args) == 1 {
-				devName = args[0]
-			}
-			dev, err := utils.GetDevFromManifest(manifest, devName)
+			manifest, err := model.GetManifestV2(manifestOpts.Filename, fs)
 			if err != nil {
 				return err
 			}
 
-			if err := runDown(ctx, dev, rm); err != nil {
-				analytics.TrackDown(false)
-				err = fmt.Errorf("%w\n    Find additional logs at: %s/okteto.log", err, config.GetAppHome(dev.Namespace, dev.Name))
+			if !okteto.IsOkteto() {
+				if err := manifest.ValidateForCLIOnly(); err != nil {
+					return err
+				}
+			}
+			c, _, err := okteto.GetK8sClientWithLogger(k8sLogsCtrl)
+			if err != nil {
 				return err
 			}
 
-			analytics.TrackDown(true)
+			dc := down.New(fs, okteto.NewK8sClientProviderWithLogger(k8sLogsCtrl), at)
+
+			if all {
+				err := dc.AllDown(ctx, manifest, okteto.GetContext().Namespace, rm)
+				if err != nil {
+					return err
+				}
+
+				oktetoLog.Success("All development containers are deactivated")
+				return nil
+			} else {
+				devName := ""
+				if len(args) == 1 {
+					devName = args[0]
+				}
+				dev, err := utils.GetDevFromManifest(manifest, devName)
+				if err != nil {
+					if !errors.Is(err, utils.ErrNoDevSelected) {
+						return err
+					}
+					options := apps.ListDevModeOn(ctx, manifest.Dev, okteto.GetContext().Namespace, c)
+
+					if len(options) == 0 {
+						oktetoLog.Success("All development containers are deactivated")
+						return nil
+					}
+					if len(options) == 1 {
+						dev = manifest.Dev[options[0]]
+						err = nil
+					} else {
+						selector := utils.NewOktetoSelector("Select which development container to deactivate:", "Development container")
+						dev, err = utils.SelectDevFromManifest(manifest, selector, options)
+					}
+					if err != nil {
+						return err
+					}
+				}
+
+				app, _, err := utils.GetApp(ctx, dev, okteto.GetContext().Namespace, c, false)
+				if err != nil {
+					return err
+				}
+
+				if apps.IsDevModeOn(app) {
+					if err := dc.Down(ctx, dev, okteto.GetContext().Namespace, rm); err != nil {
+						at.TrackDown(false)
+						return fmt.Errorf("%w\n    Find additional logs at: %s/okteto.log", err, config.GetAppHome(okteto.GetContext().Namespace, dev.Name))
+					}
+				} else {
+					oktetoLog.Success(fmt.Sprintf("Development container '%s' deactivated", dev.Name))
+				}
+			}
+
+			at.TrackDown(true)
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVarP(&devPath, "file", "f", utils.DefaultManifest, "path to the manifest file")
-	cmd.Flags().BoolVarP(&rm, "volumes", "v", false, "remove persistent volume")
-	cmd.Flags().BoolVarP(&all, "all", "A", false, "deactivate all running dev containers")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "namespace where the down command is executed")
-	cmd.Flags().StringVarP(&k8sContext, "context", "c", "", "context where the down command is executed")
+	cmd.Flags().StringVarP(&devPath, "file", "f", "", "the path to the Okteto manifest")
+	cmd.Flags().BoolVarP(&rm, "volumes", "v", false, "remove persistent volumes where your local folder is synched on remote")
+	cmd.Flags().BoolVarP(&all, "all", "A", false, "deactivate all running Development Containers")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "overwrite the current Okteto Namespace")
+	cmd.Flags().StringVarP(&k8sContext, "context", "c", "", "overwrite the current Okteto Context")
 	return cmd
-}
-
-func allDown(ctx context.Context, manifest *model.Manifest, rm bool) error {
-	if len(manifest.Dev) == 0 {
-		return fmt.Errorf("okteto manifest has no 'dev' section. Configure it with 'okteto init'")
-	}
-	for _, dev := range manifest.Dev {
-		if err := runDown(ctx, dev, rm); err != nil {
-			analytics.TrackDown(false)
-			err = fmt.Errorf("%w\n    Find additional logs at: %s/okteto.log", err, config.GetAppHome(dev.Namespace, dev.Name))
-			return err
-		}
-	}
-	analytics.TrackDown(true)
-	return nil
-}
-
-func runDown(ctx context.Context, dev *model.Dev, rm bool) error {
-	spinner := utils.NewSpinner("Deactivating your development container...")
-	spinner.Start()
-	defer spinner.Stop()
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt)
-	exit := make(chan error, 1)
-
-	go func() {
-		c, _, err := okteto.GetK8sClient()
-		if err != nil {
-			exit <- err
-			return
-		}
-
-		spinner.Stop()
-
-		app, _, err := utils.GetApp(ctx, dev, c, false)
-		if err != nil {
-			if !oktetoErrors.IsNotFound(err) {
-				exit <- err
-				return
-			}
-			app = apps.NewDeploymentApp(deployments.Sandbox(dev))
-		}
-		if dev.Autocreate {
-			app = apps.NewDeploymentApp(deployments.Sandbox(dev))
-		}
-		spinner.Start()
-
-		trMap, err := apps.GetTranslations(ctx, dev, app, false, c)
-		if err != nil {
-			exit <- err
-			return
-		}
-
-		if err := down.Run(dev, app, trMap, true, c); err != nil {
-			exit <- err
-			return
-		}
-
-		spinner.Stop()
-		oktetoLog.Success("Development container deactivated")
-
-		if !rm {
-			exit <- nil
-			return
-		}
-
-		spinner.Update("Removing persistent volume...")
-		spinner.Start()
-		if err := removeVolume(ctx, dev); err != nil {
-			analytics.TrackDownVolumes(false)
-			exit <- err
-			return
-		}
-		spinner.Stop()
-		oktetoLog.Success("Persistent volume removed")
-
-		if os.Getenv(model.OktetoSkipCleanupEnvVar) == "" {
-			if err := syncthing.RemoveFolder(dev); err != nil {
-				oktetoLog.Infof("failed to delete existing syncthing folder")
-			}
-		}
-
-		analytics.TrackDownVolumes(true)
-		exit <- nil
-	}()
-
-	select {
-	case <-stop:
-		oktetoLog.Infof("CTRL+C received, starting shutdown sequence")
-		spinner.Stop()
-		return oktetoErrors.ErrIntSig
-	case err := <-exit:
-		if err != nil {
-			oktetoLog.Infof("exit signal received due to error: %s", err)
-			return err
-		}
-	}
-	return nil
-}
-
-func removeVolume(ctx context.Context, dev *model.Dev) error {
-	c, _, err := okteto.GetK8sClient()
-	if err != nil {
-		return err
-	}
-
-	return volumes.Destroy(ctx, dev.GetVolumeName(), dev.Namespace, c, dev.Timeout.Default)
 }

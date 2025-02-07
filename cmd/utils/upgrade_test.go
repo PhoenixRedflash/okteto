@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,21 +17,26 @@ import (
 	"testing"
 
 	"github.com/Masterminds/semver/v3"
+	"github.com/stretchr/testify/assert"
 )
 
 func Test_shouldNotify(t *testing.T) {
-	one, _ := semver.NewVersion("1.0.0")
-	oneZeroOne, _ := semver.NewVersion("1.0.1")
-	oneOneZero, _ := semver.NewVersion("1.1.0")
-	two, _ := semver.NewVersion("2.0.0")
+	one, err := semver.NewVersion("1.0.0")
+	assert.NoError(t, err)
+	oneZeroOne, err := semver.NewVersion("1.0.1")
+	assert.NoError(t, err)
+	oneOneZero, err := semver.NewVersion("1.1.0")
+	assert.NoError(t, err)
+	two, err := semver.NewVersion("2.0.0")
+	assert.NoError(t, err)
 
 	type args struct {
 		latest  *semver.Version
 		current *semver.Version
 	}
 	tests := []struct {
-		name string
 		args args
+		name string
 		want bool
 	}{
 		{name: "equal", args: args{latest: oneOneZero, current: oneOneZero}, want: false},

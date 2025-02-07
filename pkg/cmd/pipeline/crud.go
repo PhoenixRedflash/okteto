@@ -1,4 +1,4 @@
-// Copyright 2021 The Okteto Authors
+// Copyright 2024 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/okteto/okteto/pkg/format"
 	"github.com/okteto/okteto/pkg/k8s/configmaps"
 	"github.com/okteto/okteto/pkg/k8s/deployments"
 	"github.com/okteto/okteto/pkg/k8s/statefulsets"
@@ -37,7 +38,7 @@ func IsDeployed(ctx context.Context, name, namespace string, c kubernetes.Interf
 
 // ListDeployments list all the deployments created by the pipeline
 func ListDeployments(ctx context.Context, name, ns string, c kubernetes.Interface) ([]v1.Deployment, error) {
-	labels := fmt.Sprintf("%s=%s", model.DeployedByLabel, name)
+	labels := fmt.Sprintf("%s=%s", model.DeployedByLabel, format.ResourceK8sMetaString(name))
 	dList, err := deployments.List(ctx, ns, labels, c)
 	if err != nil {
 		return nil, err
@@ -47,7 +48,7 @@ func ListDeployments(ctx context.Context, name, ns string, c kubernetes.Interfac
 
 // ListStatefulsets list all the sfs created by the pipeline
 func ListStatefulsets(ctx context.Context, name, ns string, c kubernetes.Interface) ([]v1.StatefulSet, error) {
-	labels := fmt.Sprintf("%s=%s", model.DeployedByLabel, name)
+	labels := fmt.Sprintf("%s=%s", model.DeployedByLabel, format.ResourceK8sMetaString(name))
 	sfsList, err := statefulsets.List(ctx, ns, labels, c)
 	if err != nil {
 		return nil, err
@@ -55,9 +56,9 @@ func ListStatefulsets(ctx context.Context, name, ns string, c kubernetes.Interfa
 	return sfsList, nil
 }
 
-// HasDeployedSomething checks if the pipeline has deployed any deployment/statefulset/job
+// HasDeployedSomething checks if the pipeline has deployed any deployment/statefulset
 func HasDeployedSomething(ctx context.Context, name, ns string, c kubernetes.Interface) (bool, error) {
-	labels := fmt.Sprintf("%s=%s", model.DeployedByLabel, name)
+	labels := fmt.Sprintf("%s=%s", model.DeployedByLabel, format.ResourceK8sMetaString(name))
 	dList, err := deployments.List(ctx, ns, labels, c)
 	if err != nil {
 		return false, err

@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -28,48 +28,55 @@ import (
 
 var output string
 
-// Lists all contexts managed by okteto
+// List returns all contexts managed by okteto
 func List() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"ls"},
-		Args:    utils.NoArgsAccepted("https://okteto.com/docs/reference/cli/#list"),
-		Short:   "List available contexts",
+		Args:    utils.NoArgsAccepted("https://okteto.com/docs/reference/okteto-cli/#list"),
+		Short:   "List available Okteto Contexts",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
-			if err := executeListContext(ctx); err != nil {
+			if err := NewContextCommand().Run(ctx, &Options{raiseNotCtxError: true}); err != nil {
 				return err
 			}
-
-			return nil
+			return executeListContext()
 		},
 	}
 	cmd.Flags().StringVarP(&output, "output", "o", "", "Output format. One of: json|yaml")
 	return cmd
 }
 
-func executeListContext(ctx context.Context) error {
-	contexts := getOktetoClusters(false)
+func executeListContext() error {
+	contexts := getOktetoClusters()
 	contexts = append(contexts, getK8sClusters(getKubernetesContextList(true))...)
 
 	if len(contexts) == 0 {
 		return fmt.Errorf("no contexts are available. Run 'okteto context' to configure your first okteto context")
 	}
 
-	ctxStore := okteto.ContextStore()
+	ctxStore := okteto.GetContextStore()
 
-	var ctxs []okteto.OktetoContextViewer
+	var ctxs []okteto.ContextViewer
 	for _, ctxSelector := range contexts {
-		if okCtx, ok := ctxStore.Contexts[ctxSelector.Name]; ok && okCtx.Builder != "" {
-			ctxSelector.Builder = okCtx.Builder
+		okCtx, isOkteto := ctxStore.Contexts[ctxSelector.Name]
+
+		ctxViewer := okteto.ContextViewer{
+			Name:     ctxSelector.Name,
+			Builder:  "docker",
+			Registry: "-",
+			Current:  okteto.GetContext().Name == ctxSelector.Name,
 		}
-		ctxs = append(ctxs, okteto.OktetoContextViewer{
-			Name:      ctxSelector.Name,
-			Namespace: ctxSelector.Namespace,
-			Builder:   ctxSelector.Builder,
-			Registry:  ctxSelector.Registry,
-			Current:   okteto.Context().Name == ctxSelector.Name,
-		})
+		if isOkteto {
+			ctxViewer.Registry = okCtx.Registry
+			ctxViewer.Namespace = okCtx.Namespace
+			if okCtx.Builder != "" {
+				ctxViewer.Builder = okCtx.Builder
+			}
+		} else {
+			ctxViewer.Namespace = getKubernetesContextNamespace(ctxSelector.Name)
+		}
+		ctxs = append(ctxs, ctxViewer)
 	}
 
 	if output == "" {

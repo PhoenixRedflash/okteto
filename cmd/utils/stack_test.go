@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,7 +20,9 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/okteto/okteto/pkg/env"
 	"github.com/okteto/okteto/pkg/model"
+	"github.com/spf13/afero"
 )
 
 const (
@@ -39,12 +41,9 @@ const (
 )
 
 func Test_multipleStack(t *testing.T) {
-	dir, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir := t.TempDir()
 	log.Printf("created tempdir: %s", dir)
-
+	t.Setenv("OKTETO_SUPPORT_STACKS_ENABLED", "true")
 	path, err := createFile(dir, "docker-compose.yml", firstStack)
 	if err != nil {
 		t.Fatal(err)
@@ -57,13 +56,13 @@ func Test_multipleStack(t *testing.T) {
 	}
 	paths = append(paths, path)
 
-	stack, err := model.LoadStack("", paths, false)
+	stack, err := model.LoadStack("", paths, false, afero.NewMemMapFs())
 	if err != nil {
 		t.Fatal(err)
 	}
 	var svcResult = &model.Service{
-		Environment: model.Environment{
-			model.EnvVar{
+		Environment: env.Environment{
+			env.Var{
 				Name:  "a",
 				Value: "b",
 			},
@@ -85,10 +84,10 @@ func Test_multipleStack(t *testing.T) {
 		t.Fatalf("Expected %v but got %v", svcResult.Image, svc.Image)
 	}
 
-	os.Setenv("OKTETO_BUILD_APP_IMAGE", "test")
+	t.Setenv("OKTETO_BUILD_APP_IMAGE", "test")
 	svcResult.Image = "test"
 
-	stack, err = model.LoadStack("", paths, true)
+	stack, err = model.LoadStack("", paths, true, afero.NewMemMapFs())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,10 +106,9 @@ func Test_multipleStack(t *testing.T) {
 }
 
 func Test_overrideFileStack(t *testing.T) {
-	dir, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Setenv("OKTETO_BUILD_APP_IMAGE", "test")
+
+	dir := t.TempDir()
 	log.Printf("created tempdir: %s", dir)
 
 	path, err := createFile(dir, "docker-compose.yml", firstStack)
@@ -124,14 +122,14 @@ func Test_overrideFileStack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stack, err := model.LoadStack("", paths, true)
+	stack, err := model.LoadStack("", paths, true, afero.NewMemMapFs())
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var svcResult = &model.Service{
-		Environment: model.Environment{
-			model.EnvVar{
+		Environment: env.Environment{
+			env.Var{
 				Name:  "a",
 				Value: "b",
 			},
@@ -158,7 +156,7 @@ func Test_overrideFileStack(t *testing.T) {
 func createFile(dir, name, content string) (string, error) {
 	dockerfilePath := filepath.Join(dir, name)
 	dockerfileContent := []byte(content)
-	if err := os.WriteFile(dockerfilePath, dockerfileContent, 0644); err != nil {
+	if err := os.WriteFile(dockerfilePath, dockerfileContent, 0600); err != nil {
 		return dockerfilePath, err
 	}
 	return dockerfilePath, nil

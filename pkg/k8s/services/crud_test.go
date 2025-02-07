@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,6 +19,7 @@ import (
 
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/k8s/labels"
+	"github.com/stretchr/testify/require"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -35,13 +36,9 @@ func TestGet(t *testing.T) {
 
 	clientset := fake.NewSimpleClientset(svc)
 	s, err := Get(ctx, svc.GetName(), svc.GetNamespace(), clientset)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	if s == nil {
-		t.Fatal("empty service")
-	}
+	require.NoError(t, err)
+	require.NotNil(t, s)
 
 	if s.Name != svc.GetName() {
 		t.Fatalf("wrong service. Got %s, expected %s", s.Name, svc.GetName())

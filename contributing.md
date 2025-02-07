@@ -76,9 +76,25 @@ git push origin <branch-name>
 
 Once you do that and visit the repository, you should see a button on the GitHub UI prompting you to make a PR.
 
+##### Pull Request Labels
+
+In order to assist the team in generating quality release notes, all PRs must have the appropriate labels based on the scope of the change. One of the following labels must be applied to Pull Requests:
+
+![Release Labels](docs/release-labels.png)
+
+The `release/internal` label indicates that the change is associated with contents in the repo that are not associated with any code release. This would include updates to docs or tests in the repo which are not included in the release binaries.
+
+If a pull request includes a new feature that does not affect existing feature sets then you'd add the `release/new-feature` label.
+
+Pull requests containing bug fixes should have the `release/bug-fix` label.
+
+Any change that breaks, or significantly alters, current behavior should be labeled with `release/breaking-change`.
+
+If a pull request does not have one of these labels checks will fail and PR merging will be blocked. If you're unsure which label to apply you are still more than welcome to open the PR and a team member can help identify the correct label during the review process.
+
 ## Development Guide
 
-Okteto is developed using the [Go](https://golang.org/) programming language. The current version of Go being used is [v1.17](https://go.dev/doc/go1.17). It uses go modules for dependency management.
+Okteto is developed using the [Go](https://golang.org/) programming language. The current version of Go being used is [v1.21](https://go.dev/doc/go1.21). It uses go modules for dependency management.
 
 ### Building
 
@@ -95,6 +111,20 @@ bin/okteto
 ```
 
 After you make more changes, simply run `make` again to recompile your changes.
+
+### Executing
+
+In order to execute the `okteto` binary locally, you can do this manually by creating a copy of it to your project directory.
+
+However, there's an easy and preferred way for doing this by creating an `alias` using the following command:
+
+```
+alias <alias-name> = /path/to/okteto/binary
+```
+
+This will make sure the `alias-name` is in sync with your okteto binary. However, this is a temporary alias. If you'd like to create a permanent alias, you can read more about it [here](https://www.freecodecamp.org/news/how-to-create-your-own-command-in-linux/).
+
+**Note:** Don't use `alias-name` as _okteto_ since the actual okteto CLI tool installed locally will get in conflict with executable `okteto` binary.
 
 ### Testing
 
@@ -122,44 +152,28 @@ Before making a PR, we recommend contributors to run a lint check on their code 
 make lint
 ```
 
-The same command also runs as part of CI on every PR.
+This command will run `golangci-lint` for the repository and raise any issue that might appear. When the branch is pushed to remote, a workflow will run also this lint tool.
 
-> This command requires that you have [golangci-lint](https://github.com/golangci/golangci-lint#install) available on your `$PATH`.
+> You will need to download these tools in order to run the lint locally
+>
+> - [golangci-lint](https://golangci-lint.run/usage/install/#local-installation)
+>
+> We recommend to have an [integration](https://golangci-lint.run/usage/integrations/) with your IDE so that golangci-lint is used as default linter
 
-We also use `pre-commit` to lint our Markdown and YAML files using the following linters:
+We also recommend to install `pre-commit` hooks before opening a PR.
 
-- [markdowlint-cli](https://github.com/igorshubovych/markdownlint-cli)
-- [yamllint](https://yamllint.readthedocs.io/en/stable/index.html)
+> - [pre-commit](https://pre-commit.com/#installation)
 
-### pre-commit
+Once downloaded, run `pre-commit install` to install the hooks and before the commit is done, the checks will be run.
 
-A framework for managing and maintaining multi-language pre-commit hooks.
-Pre-commit can be [installed](https://pre-commit.com/#installation) with
-`pip`, `curl`, `brew` or `conda`.
+### Okteto Manifest and JSON Schema
 
-You need to first install pre-commit and then install the pre-commit hooks
-with `pre-commit install`. Now pre-commit will run automatically on git
-commit!
+The [Okteto Manifest](https://www.okteto.com/docs/reference/okteto-manifest/) is a YAML file used to configure development environments in Okteto.
 
-It's usually a good idea to run the hooks against all the files when
-adding new hooks (usually pre-commit will only run on the changed files
-during git hooks). Use `pre-commit run --all-files` to check all files.
+The supported fields of the Okteto Manifest are defined as Go code in the [pkg/model](pkg/model) package.
 
-To run a single hook use `pre-commit run --all-files <hook_id>`
+This repository also contains the [JSON Schema](https://json-schema.org/) for the Okteto Manifest, located in the [schema.json](schema.json) file. This file is auto-generated using the Okteto CLI itself. If you make changes to the supported fields of the Okteto Manifest, you'll need to update the [pkg/schema](pkg/schema) package and generate a new `schema.json` by running:
 
-To update use `pre-commit autoupdate`
-
-- [Quick start](https://pre-commit.com/#quick-start)
-- [Usage](https://pre-commit.com/#usage)
-- [pre-commit-autoupdate](https://pre-commit.com/#pre-commit-autoupdate)
-
-### Spell checking
-
-We are running [misspell](https://github.com/client9/misspell) to check for spelling errors using [GitHub Actions](.github/workflows/lint.yml). You can run this locally against all files using `misspell .` after [grabbing](https://github.com/client9/misspell#install) the `misspell` binary.
-
-Some useful `misspell` flags:
-
-- `-i` string: ignore the following corrections, comma-separated
-- `-w`: Overwrite file with corrections (default is just to display)
-
-We also run [codespell](https://github.com/codespell-project/codespell) to check spellings against a [small custom dictionary](codespell.txt).
+```bash
+make generate-schema
+```

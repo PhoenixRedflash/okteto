@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,8 +14,8 @@
 package model
 
 import (
-	"fmt"
 	"net"
+	"strconv"
 	"testing"
 )
 
@@ -40,12 +40,16 @@ func TestIsPortAvailable(t *testing.T) {
 		t.Fatalf("port %d wasn't available", p)
 	}
 
-	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", Localhost, p))
+	l, err := net.Listen("tcp", net.JoinHostPort(Localhost, strconv.Itoa(p)))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	defer l.Close()
+	defer func() {
+		if err := l.Close(); err != nil {
+			t.Fatalf("Error closing listener %s: %s", l.Addr(), err)
+		}
+	}()
 
 	if IsPortAvailable(Localhost, p) {
 		t.Fatalf("port %d was available", p)

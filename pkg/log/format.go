@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,7 +15,7 @@ package log
 
 import "io"
 
-//OktetoWriter implements the interface of the writers
+// OktetoWriter implements the interface of the writers
 type OktetoWriter interface {
 	Debug(args ...interface{})
 	Debugf(format string, args ...interface{})
@@ -51,12 +51,14 @@ type OktetoWriter interface {
 }
 
 const (
-	//TTYFormat represents a tty logger
+	// TTYFormat represents a tty logger
 	TTYFormat string = "tty"
-	//PlainFormat represents a plain logger
+	// PlainFormat represents a plain logger
 	PlainFormat string = "plain"
-	//JSONFormat represents a json logger
+	// JSONFormat represents a json logger
 	JSONFormat string = "json"
+	// SilentFormat represents a silent logger
+	SilentFormat string = "silent"
 )
 
 func (l *logger) getWriter(format string) OktetoWriter {
@@ -71,6 +73,9 @@ func (l *logger) getWriter(format string) OktetoWriter {
 		l.outputMode = JSONFormat
 		l.out.SetFormatter(&JSONLogFormat{})
 		return newJSONWriter(l.out, l.file)
+	case SilentFormat:
+		l.outputMode = SilentFormat
+		return newSilentWriter(l.out, l.file)
 	default:
 		Debugf("could not load %s. Callback to 'tty'", format)
 		l.outputMode = TTYFormat

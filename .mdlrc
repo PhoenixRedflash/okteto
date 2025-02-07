@@ -1,0 +1,9 @@
+rules '~MD007', '~MD013', '~MD024', '~MD025', '~MD026', '~MD033', '~MD040', '~MD041'
+# MD007 ul-indent - Unordered list indentation
+# MD013 line-length - Line length
+# MD024 no-duplicate-heading/no-duplicate-header - Multiple headings with the same content
+# MD025 single-title/single-h1 - Multiple top-level headings in the same document
+# MD026 no-trailing-punctuation - Trailing punctuation in heading
+# MD033 no-inline-html - Inline HTML
+# MD040 fenced-code-language - Fenced code blocks should have a language specified
+# MD041 first-line-heading/first-line-h1 - First line in a file should be a top-level heading

@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,15 +16,16 @@ package test
 import (
 	"os"
 
+	"github.com/okteto/okteto/pkg/constants"
 	"github.com/okteto/okteto/pkg/k8s/kubeconfig"
-	"github.com/okteto/okteto/pkg/model"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 type KubeconfigFields struct {
+	CurrentContext string
+	ClusterCert    string
 	Name           []string
 	Namespace      []string
-	CurrentContext string
 }
 
 func CreateKubeconfig(kubeconfigFields KubeconfigFields) (string, error) {
@@ -33,7 +34,7 @@ func CreateKubeconfig(kubeconfigFields KubeconfigFields) (string, error) {
 		return "", err
 	}
 
-	os.Setenv(model.KubeConfigEnvVar, dir.Name())
+	os.Setenv(constants.KubeConfigEnvVar, dir.Name())
 
 	contexts := make(map[string]*clientcmdapi.Context)
 	for idx := range kubeconfigFields.Name {
@@ -42,6 +43,11 @@ func CreateKubeconfig(kubeconfigFields KubeconfigFields) (string, error) {
 	cfg := &clientcmdapi.Config{
 		Contexts:       contexts,
 		CurrentContext: kubeconfigFields.CurrentContext,
+		Clusters: map[string]*clientcmdapi.Cluster{
+			kubeconfigFields.CurrentContext: {
+				CertificateAuthorityData: []byte(kubeconfigFields.ClusterCert),
+			},
+		},
 	}
 	if err := kubeconfig.Write(cfg, dir.Name()); err != nil {
 		return "", err

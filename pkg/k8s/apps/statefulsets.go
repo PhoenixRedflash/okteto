@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,6 +23,7 @@ import (
 	"github.com/okteto/okteto/pkg/k8s/statefulsets"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
 	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,12 +33,12 @@ import (
 )
 
 type StatefulSetApp struct {
-	kind string
 	sfs  *appsv1.StatefulSet
+	kind string
 }
 
 func NewStatefulSetApp(sfs *appsv1.StatefulSet) *StatefulSetApp {
-	return &StatefulSetApp{kind: model.StatefulSet, sfs: sfs}
+	return &StatefulSetApp{kind: okteto.StatefulSet, sfs: sfs}
 }
 
 func (i *StatefulSetApp) Kind() string {
@@ -59,7 +60,7 @@ func (i *StatefulSetApp) Replicas() int32 {
 }
 
 func (i *StatefulSetApp) SetReplicas(n int32) {
-	i.sfs.Spec.Replicas = pointer.Int32Ptr(n)
+	i.sfs.Spec.Replicas = pointer.Int32(n)
 }
 
 func (i *StatefulSetApp) TemplateObjectMeta() metav1.ObjectMeta {
@@ -115,7 +116,7 @@ func (i *StatefulSetApp) RestoreOriginal() error {
 	oktetoLog.Info("depreccated devmodeoff behavior")
 	sfsOrig := &appsv1.StatefulSet{}
 	if err := json.Unmarshal([]byte(manifest), sfsOrig); err != nil {
-		return fmt.Errorf("malformed manifest: %v", err)
+		return fmt.Errorf("malformed manifest: %w", err)
 	}
 	i.sfs = sfsOrig
 	return nil
@@ -154,11 +155,10 @@ func (i *StatefulSetApp) Watch(ctx context.Context, result chan error, c kuberne
 				}
 				continue
 			}
-			switch e.Type {
-			case watch.Deleted:
+			if e.Type == watch.Deleted {
 				result <- oktetoErrors.ErrDeleteToApp
 				return
-			case watch.Modified:
+			} else if e.Type == watch.Modified {
 				sfs, ok := e.Object.(*appsv1.StatefulSet)
 				if !ok {
 					oktetoLog.Debugf("Failed to parse statefulset event: %s", e)
@@ -190,4 +190,14 @@ func (i *StatefulSetApp) PatchAnnotations(ctx context.Context, c kubernetes.Inte
 
 func (i *StatefulSetApp) Destroy(ctx context.Context, c kubernetes.Interface) error {
 	return statefulsets.Destroy(ctx, i.sfs.Name, i.sfs.Namespace, c)
+}
+
+// GetDevClone Returns from Kubernetes the cloned statefulset
+func (i *StatefulSetApp) GetDevClone(ctx context.Context, c kubernetes.Interface) (App, error) {
+	clonedName := model.DevCloneName(i.sfs.Name)
+	sfs, err := statefulsets.Get(ctx, clonedName, i.sfs.Namespace, c)
+	if err == nil {
+		return NewStatefulSetApp(sfs), nil
+	}
+	return nil, err
 }

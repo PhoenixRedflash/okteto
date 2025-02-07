@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,38 +15,57 @@ package context
 
 import (
 	"os"
+	"strings"
 
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/okteto"
 )
 
-type ContextOptions struct {
-	Token            string
-	Context          string
-	Namespace        string
-	Builder          string
-	OnlyOkteto       bool
-	Show             bool
-	Save             bool
-	IsCtxCommand     bool
-	IsOkteto         bool
-	raiseNotCtxError bool
+type Options struct {
+	Token                 string
+	Context               string
+	Namespace             string
+	OnlyOkteto            bool
+	Show                  bool
+	Save                  bool
+	SetCurrentNs          bool
+	IsCtxCommand          bool
+	CheckNamespaceAccess  bool
+	IsOkteto              bool
+	raiseNotCtxError      bool
+	InsecureSkipTlsVerify bool
+	InferredToken         bool
 }
 
-func (o *ContextOptions) initFromContext() {
+func (o *Options) InitFromContext() {
 	if o.IsCtxCommand {
 		return
 	}
-	if o.Context != "" {
-		return
-	}
-	ctxStore := okteto.ContextStore()
-	if ctxStore.CurrentContext == "" {
+
+	ctxStore := okteto.GetContextStore()
+
+	if ctxStore.Contexts == nil {
 		return
 	}
 
-	if okCtx, ok := ctxStore.Contexts[ctxStore.CurrentContext]; ok {
-		o.Context = ctxStore.CurrentContext
+	if len(ctxStore.Contexts) == 0 {
+		return
+	}
+
+	cc := ctxStore.CurrentContext
+
+	if o.Context != "" {
+		cc = o.Context
+	} else {
+		o.Context = cc
+	}
+
+	if cc == "" {
+		return
+	}
+
+	if okCtx, ok := ctxStore.Contexts[cc]; ok {
 		if o.Namespace == "" {
 			o.Namespace = okCtx.Namespace
 		}
@@ -54,28 +73,43 @@ func (o *ContextOptions) initFromContext() {
 	}
 }
 
-func (o *ContextOptions) initFromEnvVars() {
-	if o.Token == "" {
-		o.Token = os.Getenv(model.OktetoTokenEnvVar)
-	}
+func (o *Options) InitFromEnvVars() {
+	var usedEnvVars []string
 
 	if o.Context == "" && os.Getenv(model.OktetoURLEnvVar) != "" {
 		o.Context = os.Getenv(model.OktetoURLEnvVar)
 		o.IsOkteto = true
+		usedEnvVars = append(usedEnvVars, model.OktetoURLEnvVar)
 	}
 
 	if o.Context == "" && os.Getenv(model.OktetoContextEnvVar) != "" {
 		o.Context = os.Getenv(model.OktetoContextEnvVar)
+		usedEnvVars = append(usedEnvVars, model.OktetoContextEnvVar)
 	}
 
-	if o.Token != "" {
+	envToken := os.Getenv(model.OktetoTokenEnvVar)
+	if o.Token != "" || envToken != "" {
 		o.IsOkteto = true
-		if o.Context == "" {
-			o.Context = okteto.CloudURL
+	}
+
+	if o.Token == "" && envToken != "" {
+		if !okteto.HasBeenLogged(o.Context) || okteto.GetContext().Token != envToken {
+			usedEnvVars = append(usedEnvVars, model.OktetoTokenEnvVar)
 		}
+		o.Token = envToken
+		o.InferredToken = true
 	}
 
 	if o.Namespace == "" && os.Getenv(model.OktetoNamespaceEnvVar) != "" {
 		o.Namespace = os.Getenv(model.OktetoNamespaceEnvVar)
+		usedEnvVars = append(usedEnvVars, model.OktetoNamespaceEnvVar)
+	}
+
+	if o.Show {
+		if len(usedEnvVars) == 1 {
+			oktetoLog.Warning("Initializing context with the value of %s environment variable", usedEnvVars[0])
+		} else if len(usedEnvVars) > 1 {
+			oktetoLog.Warning("Initializing context with the value of %s and %s environment variables", strings.Join(usedEnvVars[0:len(usedEnvVars)-1], ", "), usedEnvVars[len(usedEnvVars)-1])
+		}
 	}
 }

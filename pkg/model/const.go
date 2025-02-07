@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,14 +13,7 @@
 
 package model
 
-import apiv1 "k8s.io/api/core/v1"
-
 const (
-	// TimeFormat is the format to use when storing timestamps as a string
-	TimeFormat = "2006-01-02T15:04:05"
-
-	// DevLabel indicates the deployment is in dev mode
-	DevLabel = "dev.okteto.com"
 
 	// DevCloneLabel indicates it is a dev pod clone
 	DevCloneLabel = "dev.okteto.com/clone"
@@ -33,6 +26,9 @@ const (
 
 	// OktetoSampleAnnotation indicates that the repo is a okteto sample
 	OktetoSampleAnnotation = "dev.okteto.com/sample"
+
+	// OktetoComposeUpdateStrategyAnnotation indicates how a compose service must be updated
+	OktetoComposeUpdateStrategyAnnotation = "dev.okteto.com/update"
 
 	// DetachedDevLabel indicates the detached dev pods
 	DetachedDevLabel = "detached.dev.okteto.com"
@@ -55,25 +51,19 @@ const (
 	// TranslationAnnotation sets the translation rules
 	TranslationAnnotation = "dev.okteto.com/translation"
 
-	// SyncLabel indicates a syncthing pod
-	SyncLabel = "syncthing.okteto.com"
-
-	//OktetoRepositoryAnnotation indicates the git repo url with the source code of this component
+	// OktetoRepositoryAnnotation indicates the git repo url with the source code of this component
 	OktetoRepositoryAnnotation = "dev.okteto.com/repository"
 
-	//OktetoDevNameAnnotation indicates the name of the dev to be deployed
+	// OktetoDevNameAnnotation indicates the name of the dev to be deployed
 	OktetoDevNameAnnotation = "dev.okteto.com/name"
 
-	//OktetoPathAnnotation indicates the okteto manifest path of this component
-	OktetoPathAnnotation = "dev.okteto.com/path"
-
-	//FluxAnnotation indicates if the deployment ha been deployed by Flux
+	// FluxAnnotation indicates if the deployment ha been deployed by Flux
 	FluxAnnotation = "helm.fluxcd.io/antecedent"
 
-	//DefaultStorageClassAnnotation indicates the defaault storage class
+	// DefaultStorageClassAnnotation indicates the defaault storage class
 	DefaultStorageClassAnnotation = "storageclass.kubernetes.io/is-default-class"
 
-	//StateBeforeSleepingAnnontation indicates the state of the resource prior to scale it to zero
+	// StateBeforeSleepingAnnontation indicates the state of the resource prior to scale it to zero
 	StateBeforeSleepingAnnontation = "dev.okteto.com/state-before-sleeping"
 
 	// DeployedByLabel indicates the service account that deployed an object
@@ -94,7 +84,7 @@ const (
 	// StackEndpointNameLabel indicates the name of the endpoint an object belongs to
 	StackEndpointNameLabel = "stack.okteto.com/endpoint"
 
-	// StackIngressAutoGenerateHost generates a ingress host for
+	// OktetoIngressAutoGenerateHost generates a ingress host for
 	OktetoIngressAutoGenerateHost = "dev.okteto.com/generate-host"
 
 	// OktetoAutoIngressAnnotation indicates an ingress must be created for a service
@@ -109,84 +99,55 @@ const (
 	// StackVolumeNameLabel indicates the name of the stack volume an object belongs to
 	StackVolumeNameLabel = "stack.okteto.com/volume"
 
-	//Deployment k8s deployemnt kind
-	Deployment = "Deployment"
-	//StatefulSet k8s statefulset kind
-	StatefulSet = "StatefulSet"
-
-	//Localhost localhost
+	// Localhost localhost
 	Localhost = "localhost"
-	//PrivilegedLocalhost localhost
+	// PrivilegedLocalhost localhost
 	PrivilegedLocalhost         = "0.0.0.0"
 	oktetoSSHServerPortVariable = "OKTETO_REMOTE_PORT"
 	oktetoDefaultSSHServerPort  = 2222
-	//OktetoDefaultPVSize default volume size
-	OktetoDefaultPVSize = "2Gi"
-	//OktetoUpCmd up command
+	// OktetoUpCmd up command
 	OktetoUpCmd = "up"
-	//OktetoPushCmd push command
-	OktetoPushCmd = "push"
 
-	//DeprecatedOktetoVolumeName name of the (deprecated) okteto persistent volume
-	DeprecatedOktetoVolumeName = "okteto"
-	//OktetoVolumeNameTemplate name template of the development container persistent volume
+	// OktetoVolumeNameTemplate name template of the development container persistent volume
 	OktetoVolumeNameTemplate = "%s-okteto"
-	//DeprecatedOktetoVolumeNameTemplate name template of the development container persistent volume
-	DeprecatedOktetoVolumeNameTemplate = "okteto-%s"
-	//DataSubPath subpath in the development container persistent volume for the data volumes
+	// DataSubPath subpath in the development container persistent volume for the data volumes
 	DataSubPath = "data"
-	//SourceCodeSubPath subpath in the development container persistent volume for the source code
+	// SourceCodeSubPath subpath in the development container persistent volume for the source code
 	SourceCodeSubPath = "src"
-	//OktetoSyncthingMountPath syncthing volume mount path
+	// OktetoSyncthingMountPath syncthing volume mount path
 	OktetoSyncthingMountPath = "/var/syncthing"
-	//RemoteMountPath remote volume mount path
+	// RemoteMountPath remote volume mount path
 	RemoteMountPath = "/var/okteto/remote"
-	//SyncthingSubPath subpath in the development container persistent volume for the syncthing data
+	// SyncthingSubPath subpath in the development container persistent volume for the syncthing data
 	SyncthingSubPath = "syncthing"
-	//DefaultSyncthingRescanInterval default syncthing re-scan interval
+	// DefaultSyncthingRescanInterval default syncthing re-scan interval
 	DefaultSyncthingRescanInterval = 300
-	//RemoteSubPath subpath in the development container persistent volume for the remote data
+	// RemoteSubPath subpath in the development container persistent volume for the remote data
 	RemoteSubPath = "okteto-remote"
-	//OktetoURLAnnotation indicates the okteto cluster public url
-	OktetoURLAnnotation = "dev.okteto.com/url"
-	//OktetoAutoCreateAnnotation indicates if the deployment was auto generatted by okteto up
+	// OktetoAutoCreateAnnotation indicates if the deployment was auto generated by okteto up
 	OktetoAutoCreateAnnotation = "dev.okteto.com/auto-create"
-	//OktetoRestartAnnotation indicates the dev pod must be recreated to pull the latest version of its image
+	// OktetoDivertedNamespaceAnnotation indicates the namespace source of the diverted resource (usually a service or an ingress)
+	// The value of this annotation is the namespace of the original resource
+	OktetoDivertedNamespaceAnnotation = "divert.okteto.com/namespace"
+	// OktetoDivertHeaderAnnotation is the value used as the baggage header for diverted resources
+	OktetoDivertHeaderAnnotation = "divert.okteto.com/header"
+	// OktetoRestartAnnotation indicates the dev pod must be recreated to pull the latest version of its image
 	OktetoRestartAnnotation = "dev.okteto.com/restart"
-	//OktetoSyncAnnotation indicates the hash of the sync folders to force redeployment
+	// OktetoSyncAnnotation indicates the hash of the sync folders to force redeployment
 	OktetoSyncAnnotation = "dev.okteto.com/sync"
-	//OktetoStignoreAnnotation indicates the hash of the stignore files to force redeployment
+	// OktetoStignoreAnnotation indicates the hash of the stignore files to force redeployment
 	OktetoStignoreAnnotation = "dev.okteto.com/stignore"
-	//OktetoInjectTokenAnnotation annotation to inject the okteto token
-	OktetoInjectTokenAnnotation = "dev.okteto.com/inject-token"
 
-	//OktetoInitContainer name of the okteto init container
-	OktetoInitContainer = "okteto-init"
-
-	//DefaultImage default image for sandboxes
+	// DefaultImage default image for sandboxes
 	DefaultImage = "okteto/dev:latest"
-
-	//ResourceAMDGPU amd.com/gpu resource
-	ResourceAMDGPU apiv1.ResourceName = "amd.com/gpu"
-	//ResourceNVIDIAGPU nvidia.com/gpu resource
-	ResourceNVIDIAGPU apiv1.ResourceName = "nvidia.com/gpu"
 
 	// this path is expected by remote
 	authorizedKeysPath = "/var/okteto/remote/authorized_keys"
 
-	syncFieldDocsURL = "https://okteto.com/docs/reference/manifest/#sync-string-required"
-
-	//OktetoExtension identifies the okteto extension in kubeconfig files
-	OktetoExtension = "okteto"
+	syncFieldDocsURL = "https://okteto.com/docs/reference/okteto-manifest/#sync-string-required"
 
 	// HelmSecretType indicates the type for secrets created by Helm
 	HelmSecretType = "helm.sh/release.v1"
-
-	// OktetoGitBranchEnvVar is the name of the Git branch currently being deployed.
-	OktetoGitBranchEnvVar = "OKTETO_GIT_BRANCH"
-
-	// OktetoGitCommitEnvVar is the SHA1 hash of the last commit of the branch.
-	OktetoGitCommitEnvVar = "OKTETO_GIT_COMMIT"
 
 	// OktetoRegistryURLEnvVar is the url of the Okteto Registry
 	OktetoRegistryURLEnvVar = "OKTETO_REGISTRY_URL"
@@ -194,13 +155,10 @@ const (
 	// OktetoBuildkitHostURLEnvVar is the url of the Okteto Buildkit instance
 	OktetoBuildkitHostURLEnvVar = "BUILDKIT_HOST"
 
-	// OktetoBinEnvVar defines the okteto binary that should be used
-	OktetoBinEnvVar = "OKTETO_BIN"
-
 	// OktetoSkipCleanupEnvVar defines the okteto binary that should be used
 	OktetoSkipCleanupEnvVar = "OKTETO_SKIP_CLEANUP"
 
-	// OktetoUserEnvVar defines the user is using okteto
+	// OktetoUserEnvVar defines the user using okteto
 	OktetoUserEnvVar = "OKTETO_USER"
 
 	// OktetoUserNameEnvVar defines the user is using okteto
@@ -218,13 +176,13 @@ const (
 	// OktetoNamespaceEnvVar defines the namespace the user is using
 	OktetoNamespaceEnvVar = "OKTETO_NAMESPACE"
 
-	// OktetoLanguageEnvVar defines the language of the dev
-	OktetoLanguageEnvVar = "OKTETO_LANGUAGE"
+	// OktetoDomainEnvVar defines the domain the user is using
+	OktetoDomainEnvVar = "OKTETO_DOMAIN"
 
 	// SyncthingVersionEnvVar defines the syncthing version okteto should use
 	SyncthingVersionEnvVar = "OKTETO_SYNCTHING_VERSION"
 
-	// OktetoSkipContextTest if set skips the context test
+	// OktetoSkipContextTestEnvVar if set skips the context test
 	OktetoSkipContextTestEnvVar = "OKTETO_SKIP_CONTEXT_TEST"
 
 	// OktetoAutoDeployEnvVar if set the application will be deployed while running okteto up
@@ -236,43 +194,18 @@ const (
 	// OktetoPathEnvVar defines where is okteto binary
 	OktetoPathEnvVar = "OKTETO_PATH"
 
-	// OktetoOriginEnvVar defines where is executing okteto
-	OktetoOriginEnvVar = "OKTETO_ORIGIN"
-
-	// OktetoFolderEnvVar defines the path of okteto folder
-	OktetoFolderEnvVar = "OKTETO_FOLDER"
-
-	// OktetoHomeEnvVar defines the path of okteto folder
-	OktetoHomeEnvVar = "OKTETO_HOME"
-
 	// OktetoExecuteSSHEnvVar defines if the command should be executed through ssh
 	OktetoExecuteSSHEnvVar = "OKTETO_EXECUTE_SSH"
 
-	// OktetoNameEnvVar defines if the command is running inside okteot
-	OktetoNameEnvVar = "OKTETO_NAME"
-
-	// OktetoKubernetesTimeoutEnvVar defines the timeout for kubernetes operations
-	OktetoKubernetesTimeoutEnvVar = "OKTETO_KUBERNETES_TIMEOUT"
-
-	// OktetoDisableSpinnerEnvVar if true spinner is disabled
-	OktetoDisableSpinnerEnvVar = "OKTETO_DISABLE_SPINNER"
+	// OktetoSSHTimeoutEnvVar defines the timeout for ssh operations
+	OktetoSSHTimeoutEnvVar = "OKTETO_SSH_TIMEOUT"
 
 	// OktetoRescanIntervalEnvVar defines the time between scans for syncthing
 	OktetoRescanIntervalEnvVar = "OKTETO_RESCAN_INTERVAL"
 
-	// OktetoWithinDeployCommandContextEnvVar defines if an okteto command is executed by deploy command
-	OktetoWithinDeployCommandContextEnvVar = "OKTETO_WITHIN_DEPLOY_COMMAND_CONTEXT"
-
-	// OktetoInInstaller if set to true okteto is running inside the pipeline installer
-	OktetoInInstaller = "OKTETO_IN_INSTALLER"
-
-	// OktetoSkipConfigCredentialsUpdate prevents the kubernetes config from being updated
-	// with the okteto credentials
-	OktetoSkipConfigCredentialsUpdate = "OKTETO_SKIP_CONFIG_CREDENTIALS_UPDATE"
-
-	// OktetoCurrentDeployBelongsToPreview if set the current okteto deploy belongs
+	// DeprecatedOktetoCurrentDeployBelongsToPreviewEnvVar if set the current okteto deploy belongs
 	// to a preview environment
-	OktetoCurrentDeployBelongsToPreview = "OKTETO_CURRENT_DEPLOY_BELONGS_TO_PREVIEW"
+	DeprecatedOktetoCurrentDeployBelongsToPreviewEnvVar = "OKTETO_CURRENT_DEPLOY_BELONGS_TO_PREVIEW"
 
 	// OktetoTimeoutEnvVar defines the timeout for okteto commands
 	OktetoTimeoutEnvVar = "OKTETO_TIMEOUT"
@@ -283,28 +216,13 @@ const (
 	// TermEnvVar defines the type of terminal the user is using
 	TermEnvVar = "TERM"
 
-	// HomeEnvVar defines home directory
-	HomeEnvVar = "HOME"
-
-	// HomePathEnvVar defines home path
-	HomePathEnvVar = "HOMEPATH"
-
-	// HomeDriveEnvVar defines home drive
-	HomeDriveEnvVar = "HOMEDRIVE"
-
-	// UserProfileEnvVar defines user profile
-	UserProfileEnvVar = "USERPROFILE"
-
-	// KubeConfigEnvVar defines the path where kubeconfig is stored
-	KubeConfigEnvVar = "KUBECONFIG"
-
 	// GithubRepositoryEnvVar defines the repository to be used
 	GithubRepositoryEnvVar = "GITHUB_REPOSITORY"
 
-	// GithubRepositoryEnvVar defines the branch to be used
+	// GithubRefEnvVar defines the branch to be used
 	GithubRefEnvVar = "GITHUB_REF"
 
-	// GithubRepositoryEnvVar defines the server to be used
+	// GithubServerURLEnvVar defines the server to be used
 	GithubServerURLEnvVar = "GITHUB_SERVER_URL"
 
 	// ComposeFileEnvVar defines the compose files to use
@@ -316,15 +234,15 @@ const (
 	// OktetoActionNameEnvVar defines the name of the pipeline action name
 	OktetoActionNameEnvVar = "OKTETO_ACTION_NAME"
 
+	// OktetoComposeUpdateStrategyEnvVar defines the strategy on compose to update the services
+	OktetoComposeUpdateStrategyEnvVar = "OKTETO_COMPOSE_UPDATE_STRATEGY"
+
 	// OktetoAutogenerateStignoreEnvVar skips the autogenerate stignore dialog and creates the default one
 	OktetoAutogenerateStignoreEnvVar = "OKTETO_AUTOGENERATE_STIGNORE"
 
 	// OktetoDefaultImageTag default tag assigned to image to build
 	OktetoDefaultImageTag = "okteto"
 
-	// OktetoImageTagWithVolumes is the tag assigned to an image with volume mounts
-	OktetoImageTagWithVolumes = "okteto-with-volume-mounts"
-
-	//OktetoDivertedFromLabel represents an object is diverted from another one
-	OktetoDivertedFromLabel = "dev.okteto.com/divert-from"
+	// IgnoreFilename is the name of the okteto ignore file
+	IgnoreFilename = ".oktetoignore"
 )

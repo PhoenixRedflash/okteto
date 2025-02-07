@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,60 +18,76 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
-	"text/template"
+
+	"github.com/okteto/okteto/pkg/cmd/login/html"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/types"
 )
 
 // Handler handles the authentication using a browser
 type Handler struct {
 	ctx      context.Context
+	response chan *types.User
+	errChan  chan error
 	state    string
 	baseURL  string
 	port     int
-	response chan string
-	errChan  chan error
-}
-
-// OriginData
-type OriginData struct {
-	Meta    string
-	Origin  string
-	Message string
 }
 
 func (h *Handler) handle() http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.Header().Add("Access-Control-Allow-Origin", h.baseURL)
+			w.Header().Add("Access-Control-Allow-Methods", "GET")
+			w.Header().Add("Access-Control-Allow-Private-Network", "true")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
 		code := r.URL.Query().Get("code")
 		s := r.URL.Query().Get("state")
 
 		if h.state != s {
 			h.errChan <- fmt.Errorf("invalid request state")
-			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
-		data := &OriginData{
-			Meta:    "http-equiv=\"Content-type\" content=\"text/html; charset=utf-8\"",
-			Origin:  "the Okteto CLI",
-			Message: "Close this window and go back to your terminal",
+		ctx := r.Context()
+		oktetoClient, err := okteto.NewOktetoClientFromUrl(h.baseURL)
+		if err != nil {
+			h.errChan <- err
+			return
+		}
+		u, err := oktetoClient.Auth(ctx, code)
+		if err != nil {
+			if err := html.ExecuteError(w, err); err != nil {
+				h.errChan <- err
+				return
+			}
+			// we need to return a legible error for the CLI to display
+			h.errChan <- okteto.TranslateAuthError(err)
+			return
+		}
+		if err := html.ExecuteSuccess(w); err != nil {
+			h.errChan <- err
+			return
 		}
 
-		htmlTemplate := template.Must(template.New("response").Parse(loginHTMLTemplate))
-		if err := htmlTemplate.Execute(w, data); err != nil {
-			h.errChan <- fmt.Errorf("failed to write to the response: %s", err)
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		h.response <- code
+		h.response <- u
 	}
 
 	return http.HandlerFunc(fn)
 }
 
 // AuthorizationURL returns the authorization URL used for login
-func (h *Handler) AuthorizationURL() string {
+func (h *Handler) AuthorizationURL() (string, error) {
 	redirectURL := fmt.Sprintf("http://127.0.0.1:%d/authorization-code/callback?state=%s", h.port, h.state)
 	params := url.Values{}
 	params.Add("state", h.state)
@@ -79,11 +95,11 @@ func (h *Handler) AuthorizationURL() string {
 
 	authorizationURL, err := url.Parse(fmt.Sprintf("%s/auth/authorization-code", h.baseURL))
 	if err != nil {
-		log.Fatalf("failed to build authorizationURL: %s", err)
+		return "", fmt.Errorf("failed to build authorizationURL: %w", err)
 	}
 
 	authorizationURL.RawQuery = params.Encode()
-	return authorizationURL.String()
+	return authorizationURL.String(), nil
 }
 
 func randToken() (string, error) {

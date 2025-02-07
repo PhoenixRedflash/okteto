@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,6 +16,7 @@ package forward
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,7 +28,7 @@ import (
 	"github.com/okteto/okteto/pkg/k8s/services"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
-
+	"github.com/okteto/okteto/pkg/model/forward"
 	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -37,16 +38,16 @@ import (
 
 // PortForwardManager keeps a list of all the active port forwards
 type PortForwardManager struct {
-	stopped        bool
-	iface          string
-	ports          map[int]model.Forward
+	ctx            context.Context
+	client         kubernetes.Interface
+	ports          map[int]forward.Forward
 	services       map[string]struct{}
 	activeDev      *active
 	activeServices map[string]*active
-	ctx            context.Context
 	restConfig     *rest.Config
-	client         kubernetes.Interface
+	iface          string
 	namespace      string
+	stopped        bool
 }
 
 type active struct {
@@ -83,7 +84,7 @@ func NewPortForwardManager(ctx context.Context, iface string, restConfig *rest.C
 	return &PortForwardManager{
 		ctx:        ctx,
 		iface:      iface,
-		ports:      make(map[int]model.Forward),
+		ports:      make(map[int]forward.Forward),
 		services:   make(map[string]struct{}),
 		restConfig: restConfig,
 		client:     c,
@@ -92,13 +93,14 @@ func NewPortForwardManager(ctx context.Context, iface string, restConfig *rest.C
 }
 
 // Add initializes a port forward
-func (p *PortForwardManager) Add(f model.Forward) error {
+func (p *PortForwardManager) Add(f forward.Forward) error {
 	if _, ok := p.ports[f.Local]; ok {
 		return fmt.Errorf("port %d is listed multiple times, please check your configuration", f.Local)
 	}
 
 	if !model.IsPortAvailable(p.iface, f.Local) {
-		if f.Local <= 1024 {
+		maxSystemPorts := 1024
+		if f.Local <= maxSystemPorts {
 			os := runtime.GOOS
 			switch os {
 			case "darwin":
@@ -118,8 +120,13 @@ func (p *PortForwardManager) Add(f model.Forward) error {
 	return nil
 }
 
+// StartGlobalForwarding is not implemented
+func (*PortForwardManager) StartGlobalForwarding() error {
+	return fmt.Errorf("not implemented")
+}
+
 // AddReverse is not implemented
-func (p *PortForwardManager) AddReverse(_ model.Reverse) error {
+func (*PortForwardManager) AddReverse(_ model.Reverse) error {
 	return fmt.Errorf("not implemented")
 }
 
@@ -136,8 +143,12 @@ func (p *PortForwardManager) Start(devPod, namespace string) error {
 		err := devPF.ForwardPorts()
 		if err != nil {
 			oktetoLog.Infof("k8s forwarding to dev pod finished with errors: %s", err)
-			p.activeDev.closeReady()
-			p.activeDev.err = err
+			if p.activeDev != nil {
+				if !errors.Is(err, portforward.ErrLostConnectionToPod) {
+					p.activeDev.closeReady()
+				}
+				p.activeDev.err = err
+			}
 		}
 	}()
 
@@ -170,7 +181,7 @@ func (p *PortForwardManager) Stop() {
 	oktetoLog.Infof("stopped k8s forwarder")
 }
 
-func (fm *PortForwardManager) TransformLabelsToServiceName(f model.Forward) (model.Forward, error) {
+func (fm *PortForwardManager) TransformLabelsToServiceName(f forward.Forward) (forward.Forward, error) {
 	serviceName, err := fm.GetServiceNameByLabel(fm.namespace, f.Labels)
 	if err != nil {
 		return f, err
@@ -237,7 +248,7 @@ func (p *PortForwardManager) buildForwarderToService(ctx context.Context, namesp
 	return p.buildForwarder(pod.GetNamespace(), pod.GetName(), ports)
 }
 
-func getServicePorts(service string, forwards map[int]model.Forward) []string {
+func getServicePorts(service string, forwards map[int]forward.Forward) []string {
 	ports := []string{}
 	for _, f := range forwards {
 		if f.Service && f.ServiceName == service {

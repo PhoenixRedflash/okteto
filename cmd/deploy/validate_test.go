@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,38 +14,72 @@
 package deploy
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 
+	"github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/validator"
 	"github.com/stretchr/testify/assert"
 )
 
-func Test_ValidateVars(t *testing.T) {
-
+func Test_validateAndSet(t *testing.T) {
 	var tests = []struct {
-		name        string
-		variables   []string
-		expectedErr bool
+		expectedError error
+		expectedEnvs  map[string]string
+		name          string
+		variables     []string
 	}{
 		{
-			name:        "correct assingnament",
-			variables:   []string{"NAME=test"},
-			expectedErr: false,
+			name:          "correct assingnament",
+			variables:     []string{"NAME=test"},
+			expectedError: nil,
+			expectedEnvs:  map[string]string{"NAME": "test"},
 		},
 		{
-			name:        "bas assingnament",
-			variables:   []string{"NAME:test"},
-			expectedErr: true,
+			name:          "bas assingnament",
+			variables:     []string{"NAME:test"},
+			expectedError: fmt.Errorf("invalid variable value '%s': must follow KEY=VALUE format", "NAME:test"),
+			expectedEnvs:  map[string]string{},
+		},
+		{
+			name:          "more than 2 equals",
+			variables:     []string{"too=many=equals"},
+			expectedError: nil,
+			expectedEnvs:  map[string]string{"too": "many=equals"},
+		},
+		{
+			name: "multiple variables",
+			variables: []string{
+				"NAME=test",
+				"BASE64=something==",
+			},
+			expectedError: nil,
+			expectedEnvs:  map[string]string{"NAME": "test", "BASE64": "something=="},
+		},
+		{
+			name:      "reserved variable name",
+			variables: []string{"OKTETO_CONTEXT=value"},
+			expectedError: errors.UserError{
+				E:    fmt.Errorf("%s is %w.", "OKTETO_CONTEXT", validator.ErrReservedVariableName),
+				Hint: "See documentation for more info: https://www.okteto.com/docs/core/credentials/environment-variables/",
+			},
+			expectedEnvs: map[string]string{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateOptionVars(tt.variables)
-			if tt.expectedErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
+			envVarStorage := make(map[string]string)
+			setEnvStorage := func(key, value string) error {
+				envVarStorage[key] = value
+				return nil
 			}
+
+			err := validateAndSet(tt.variables, setEnvStorage)
+
+			assert.Equal(t, tt.expectedError, err)
+			assert.True(t, reflect.DeepEqual(tt.expectedEnvs, envVarStorage))
 		})
 	}
 }

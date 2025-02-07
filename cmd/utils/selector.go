@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,7 +15,7 @@ package utils
 
 import (
 	"bytes"
-	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,7 +29,6 @@ import (
 	"github.com/manifoldco/promptui/list"
 	"github.com/manifoldco/promptui/screenbuf"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	"github.com/okteto/okteto/pkg/okteto"
 	"golang.org/x/term"
 )
 
@@ -38,19 +37,25 @@ const (
 	showCursor = esc + "?25h"
 )
 
-// OktetoSelector represents the selector
-type OktetoSelector struct {
-	Label string
-	Items []SelectorItem
-	Size  int
+// ErrInvalidOption is raised when the selector has an invalid option
+var ErrInvalidOption = errors.New("invalid option")
 
-	Templates *promptui.SelectTemplates
-	Keys      *promptui.SelectKeys
-
-	OktetoTemplates *oktetoTemplates
+// OktetoSelectorInterface represents an interface for a selector
+type OktetoSelectorInterface interface {
+	AskForOptionsOkteto(options []SelectorItem, initialPosition int) (string, error)
 }
 
-//oktetoTemplates stores the templates to render the text
+// OktetoSelector implements the OktetoSelectorInterface
+type OktetoSelector struct {
+	Templates       *promptui.SelectTemplates
+	Keys            *promptui.SelectKeys
+	OktetoTemplates *oktetoTemplates
+	Label           string
+	Items           []SelectorItem
+	Size            int
+}
+
+// oktetoTemplates stores the templates to render the text
 type oktetoTemplates struct {
 	FuncMap   template.FuncMap
 	label     *template.Template
@@ -62,27 +67,21 @@ type oktetoTemplates struct {
 	extraInfo *template.Template
 }
 
-//SelectorItem represents a selectable item on a selector
+// SelectorItem represents a selectable item on a selector
 type SelectorItem struct {
-	Name      string
-	Label     string
-	Enable    bool
-	IsOkteto  bool
-	Namespace string
-	Builder   string
-	Registry  string
+	Name   string
+	Label  string
+	Enable bool
 }
 
-//AskForOptionsOkteto given some options ask the user to select one
-func AskForOptionsOkteto(ctx context.Context, options []SelectorItem, label, selectedTpl string) (string, bool, error) {
+// NewOktetoSelector returns a selector set up with the label and options from the input
+func NewOktetoSelector(label string, selectedTpl string) *OktetoSelector {
 	selectedTemplate := getSelectedTemplate(selectedTpl)
 	activeTemplate := getActiveTemplate()
 	inactiveTemplate := getInactiveTemplate()
 
-	prompt := OktetoSelector{
+	return &OktetoSelector{
 		Label: label,
-		Items: options,
-		Size:  len(options),
 		Templates: &promptui.SelectTemplates{
 			Label:    "{{ .Label }}",
 			Selected: selectedTemplate,
@@ -91,15 +90,28 @@ func AskForOptionsOkteto(ctx context.Context, options []SelectorItem, label, sel
 			FuncMap:  promptui.FuncMap,
 		},
 	}
+}
 
-	prompt.Templates.FuncMap["oktetoblue"] = oktetoLog.BlueString
-	optionSelected, isOkteto, err := prompt.Run(ctx)
-	if err != nil || !isValidOption(options, optionSelected) {
+// AskForOptionsOkteto given some options ask the user to select one
+func (s *OktetoSelector) AskForOptionsOkteto(options []SelectorItem, initialPosition int) (string, error) {
+	s.Items = options
+	s.Size = len(options)
+	s.Templates.FuncMap["oktetoblue"] = oktetoLog.BlueString
+	optionSelected, err := s.run(initialPosition)
+	if err != nil || !isValidOption(s.Items, optionSelected) {
 		oktetoLog.Infof("invalid init option: %s", err)
-		return "", false, fmt.Errorf("invalid option")
+		return "", ErrInvalidOption
 	}
 
-	return optionSelected, isOkteto, nil
+	return optionSelected, nil
+}
+
+func ListToSelectorItem(list []string) []SelectorItem {
+	var items []SelectorItem
+	for _, item := range list {
+		items = append(items, SelectorItem{Name: item, Label: item, Enable: true})
+	}
+	return items
 }
 
 func isValidOption(options []SelectorItem, optionSelected string) bool {
@@ -111,21 +123,21 @@ func isValidOption(options []SelectorItem, optionSelected string) bool {
 	return false
 }
 
-//Run runs the selector prompt
-func (s *OktetoSelector) Run(ctx context.Context) (string, bool, error) {
-	startPosition, err := s.getInitialPosition(ctx)
-	if err != nil {
-		return "", false, err
-	}
-	if startPosition != -1 {
+// Run runs the selector prompt
+func (s *OktetoSelector) run(initialPosition int) (string, error) {
+	startPosition := -1
+	if initialPosition != -1 {
+		startPosition = initialPosition
 		s.Items[startPosition].Label += " *"
 	}
 	l, err := list.New(s.Items, s.Size)
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
 
-	s.prepareTemplates()
+	if err := s.prepareTemplates(); err != nil {
+		oktetoLog.Infof("error preparing templates: %s", err)
+	}
 
 	s.Keys = &promptui.SelectKeys{
 		Prev:     promptui.Key{Code: promptui.KeyPrev, Display: promptui.KeyPrevDisplay},
@@ -136,7 +148,7 @@ func (s *OktetoSelector) Run(ctx context.Context) (string, bool, error) {
 	c := &readline.Config{}
 	err = c.Init()
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
 	if runtime.GOOS != "windows" {
 		c.Stdout = &stdout{}
@@ -149,7 +161,7 @@ func (s *OktetoSelector) Run(ctx context.Context) (string, bool, error) {
 
 	rl, err := readline.NewEx(c)
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
 
 	sb := screenbuf.New(rl)
@@ -191,8 +203,9 @@ func (s *OktetoSelector) Run(ctx context.Context) (string, bool, error) {
 		s.renderLabel(sb)
 
 		help := s.renderHelp()
-		sb.Write(help)
-
+		if _, err := sb.Write(help); err != nil {
+			oktetoLog.Infof("error writing help: %s", err)
+		}
 		items, idx := l.Items()
 		last := len(items) - 1
 
@@ -220,18 +233,26 @@ func (s *OktetoSelector) Run(ctx context.Context) (string, bool, error) {
 				output = append(output, render(s.OktetoTemplates.inactive, item)...)
 			}
 
-			sb.Write(output)
+			if _, err := sb.Write(output); err != nil {
+				oktetoLog.Infof("error writing output: %s", err)
+			}
 		}
 
 		if idx == list.NotFound {
-			sb.WriteString("")
-			sb.WriteString("No results")
+			if _, err := sb.WriteString(""); err != nil {
+				oktetoLog.Infof("error writing string: %s", err)
+			}
+			if _, err := sb.WriteString("No results"); err != nil {
+				oktetoLog.Infof("error writing string: %s", err)
+			}
 		} else {
 			active := items[idx]
 
 			details := s.renderDetails(active)
 			for _, d := range details {
-				sb.Write(d)
+				if _, err := sb.Write(d); err != nil {
+					oktetoLog.Infof("error writing details: %s", err)
+				}
 			}
 		}
 
@@ -264,24 +285,31 @@ func (s *OktetoSelector) Run(ctx context.Context) (string, bool, error) {
 			err = promptui.ErrInterrupt
 		}
 		sb.Reset()
-		sb.WriteString("")
+		if _, err := sb.WriteString(""); err != nil {
+			oktetoLog.Infof("error writing string: %s", err)
+		}
 		sb.Flush()
-		rl.Write([]byte(showCursor))
+		if _, err := rl.Write([]byte(showCursor)); err != nil {
+			oktetoLog.Infof("error writing cursor: %s", err)
+		}
 		rl.Close()
-		return "", false, err
+		return "", err
 	}
 
-	items, idx := l.Items()
-	item := items[idx]
+	item := strings.TrimSpace(strings.TrimSuffix(s.Items[l.Index()].Name, " *"))
 
 	sb.Reset()
-	sb.Write(render(s.OktetoTemplates.selected, item))
+	if _, err := sb.Write(render(s.OktetoTemplates.selected, item)); err != nil {
+		oktetoLog.Infof("error writing selected: %s", err)
+	}
 	sb.Flush()
 
-	rl.Write([]byte(showCursor))
+	if _, err := rl.Write([]byte(showCursor)); err != nil {
+		oktetoLog.Infof("error writing cursor: %s", err)
+	}
 	rl.Close()
 
-	return s.Items[l.Index()].Name, s.Items[l.Index()].IsOkteto, err
+	return s.Items[l.Index()].Name, err
 }
 
 func (s *OktetoSelector) prepareTemplates() error {
@@ -371,24 +399,6 @@ func (s *OktetoSelector) prepareTemplates() error {
 	return nil
 }
 
-func (s OktetoSelector) getInitialPosition(ctx context.Context) (int, error) {
-	ctxStore := okteto.ContextStore()
-	oCtx := ctxStore.CurrentContext
-	if oCtx == "" {
-		return -1, nil
-	}
-
-	oCtx = okteto.K8sContextToOktetoUrl(ctx, oCtx, ctxStore.Contexts[oCtx].Namespace, okteto.NewK8sClientProvider())
-	idx := 0
-	for _, item := range s.Items {
-		if strings.Contains(item.Name, oCtx) {
-			return idx, nil
-		}
-		idx++
-	}
-	return -1, nil
-}
-
 func (s *OktetoSelector) renderDetails(item interface{}) [][]byte {
 	if s.OktetoTemplates.details == nil {
 		return nil
@@ -410,11 +420,16 @@ func (s *OktetoSelector) renderDetails(item interface{}) [][]byte {
 }
 
 func (s *OktetoSelector) renderLabel(sb *screenbuf.ScreenBuf) {
-	width, _, _ := term.GetSize(int(os.Stdout.Fd()))
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		oktetoLog.Infof("error getting terminal size: %s", err)
+	}
 	for _, labelLine := range strings.Split(s.Label, "\n") {
 		if width == 0 {
 			labelLineBytes := render(s.OktetoTemplates.label, labelLine)
-			sb.Write(labelLineBytes)
+			if _, err := sb.Write(labelLineBytes); err != nil {
+				oktetoLog.Infof("error writing label: %s", err)
+			}
 		} else {
 			lines := len(labelLine) / width
 			lastChar := 0
@@ -422,12 +437,16 @@ func (s *OktetoSelector) renderLabel(sb *screenbuf.ScreenBuf) {
 				if lines == i {
 					midLine := labelLine[lastChar:]
 					labelLineBytes := render(s.OktetoTemplates.label, midLine)
-					sb.Write(labelLineBytes)
+					if _, err := sb.Write(labelLineBytes); err != nil {
+						oktetoLog.Infof("error writing label: %s", err)
+					}
 					break
 				}
 				midLine := labelLine[lastChar : lastChar+width]
 				labelLineBytes := render(s.OktetoTemplates.label, midLine)
-				sb.Write(labelLineBytes)
+				if _, err := sb.Write(labelLineBytes); err != nil {
+					oktetoLog.Infof("error writing label: %s", err)
+				}
 				lastChar += width
 			}
 		}
@@ -440,8 +459,8 @@ func (s *OktetoSelector) renderHelp() []byte {
 		PrevKey     string
 		PageDownKey string
 		PageUpKey   string
-		Search      bool
 		SearchKey   string
+		Search      bool
 	}{
 		NextKey:     s.Keys.Next.Display,
 		PrevKey:     s.Keys.Prev.Display,
@@ -479,9 +498,9 @@ func (*stdout) Close() error {
 }
 
 func getSelectedTemplate(selectTpl string) string {
-	result := `{{ " ✓ " | bgGreen | black }} {{ .Label | green }}`
+	result := `{{ " ✓ " | bgGreen | black }} {{ . | green }}`
 	if selectTpl != "" {
-		result = fmt.Sprintf(`{{ " ✓ " | bgGreen | black }} {{ "%s '" | green }}{{ .Label | green }}{{ "' selected" | green }}`, selectTpl)
+		result = fmt.Sprintf(`{{ " ✓ " | bgGreen | black }} {{ "%s '" | green }}{{ . | green }}{{ "' selected" | green }}`, selectTpl)
 	}
 
 	result = changeColorForWindows(result)
@@ -496,7 +515,8 @@ func getActiveTemplate() string {
 }
 
 func getInactiveTemplate() string {
-	whitespaces := strings.Repeat(" ", 2)
+	numOfSpaces := 2
+	whitespaces := strings.Repeat(" ", numOfSpaces)
 	result := fmt.Sprintf("{{if .Enable}}%s{{ .Label }}{{else}}%s{{ .Label }}{{end}}", whitespaces, whitespaces)
 	result = changeColorForWindows(result)
 	return result

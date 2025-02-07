@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -34,7 +34,7 @@ func ValidateMountPaths(spec *apiv1.PodSpec, dev *model.Dev) error {
 			if vm.MountPath == syncVolume.RemotePath {
 				return oktetoErrors.UserError{
 					E:    fmt.Errorf("'%s' is already defined as volume in %s", vm.MountPath, dev.Name),
-					Hint: `Disable the okteto persistent volume (https://okteto.com/docs/reference/manifest/#persistentvolume-object-optional) and try again`}
+					Hint: `Disable the okteto persistent volume (https://okteto.com/docs/reference/okteto-manifest/#persistentvolume-object-optional) and try again`}
 			}
 		}
 	}

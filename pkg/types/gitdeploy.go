@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,18 +13,29 @@
 
 package types
 
+// PipelineDeployOptions represents the options to deploy a pipeline
+type PipelineDeployOptions struct {
+	Name       string
+	Repository string
+	Branch     string
+	Filename   string
+	Variables  []Variable
+	Namespace  string
+	Labels     []string
+}
+
 // SpaceBody top body answer
 type SpaceBody struct {
 	Space Space `json:"space"`
 }
 
-//GitDeployResponse represents
+// GitDeployResponse represents
 type GitDeployResponse struct {
 	Action    *Action    `json:"action"`
 	GitDeploy *GitDeploy `json:"gitDeploy"`
 }
 
-//GitDeploy represents an Okteto pipeline status
+// GitDeploy represents an Okteto pipeline status
 type GitDeploy struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`

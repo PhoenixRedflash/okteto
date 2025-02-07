@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,36 +15,39 @@ package v1
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/okteto/okteto/internal/test"
-	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/env"
+	"github.com/okteto/okteto/pkg/log/io"
 	"github.com/okteto/okteto/pkg/okteto"
 	"github.com/okteto/okteto/pkg/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
+
+type fakeBuildRunner struct {
+	mock.Mock
+}
+
+func (f *fakeBuildRunner) Run(ctx context.Context, buildOptions *types.BuildOptions, ioCtrl *io.Controller) error {
+	args := f.Called(ctx, buildOptions, ioCtrl)
+	return args.Error(0)
+}
 
 func TestBuildWithErrorFromDockerfile(t *testing.T) {
 	ctx := context.Background()
-	okteto.CurrentStore = &okteto.OktetoContextStore{
-		Contexts: map[string]*okteto.OktetoContext{
-			"test": {
-				Namespace: "test",
-			},
+
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {},
 		},
 		CurrentContext: "test",
 	}
-
-	registry := test.NewFakeOktetoRegistry(nil)
-	builder := test.NewFakeOktetoBuilder(registry, fmt.Errorf("failed to build error"))
-	bc := &OktetoBuilder{
-		Builder:  builder,
-		Registry: registry,
-	}
-	dir, err := createDockerfile()
+	buildRunner := &fakeBuildRunner{}
+	bc := NewBuilder(buildRunner, io.NewIOController())
+	dir, err := createDockerfile(t)
 	assert.NoError(t, err)
 
 	tag := "okteto.dev/test"
@@ -52,90 +55,128 @@ func TestBuildWithErrorFromDockerfile(t *testing.T) {
 		CommandArgs: []string{dir},
 		Tag:         tag,
 	}
+
+	expectedOptions := &types.BuildOptions{
+		Path:        dir,
+		File:        filepath.Join(dir, "Dockerfile"),
+		Tag:         tag,
+		CommandArgs: []string{dir},
+	}
+	buildRunner.On("Run", mock.Anything, expectedOptions, mock.Anything).Return(assert.AnError)
+
 	err = bc.Build(ctx, options)
 
 	// error from the build
 	assert.Error(t, err)
-	// the image is not at the fake registry
-	image, err := bc.Registry.GetImageTagWithDigest(tag)
-	assert.ErrorIs(t, err, oktetoErrors.ErrNotFound)
-	assert.Empty(t, image)
+
+	buildRunner.AssertExpectations(t)
 }
-func TestBuildWithNoErrorFromDockerfile(t *testing.T) {
+
+func TestBuildWithErrorFromImageExpansion(t *testing.T) {
 	ctx := context.Background()
-	okteto.CurrentStore = &okteto.OktetoContextStore{
-		Contexts: map[string]*okteto.OktetoContext{
-			"test": {
-				Namespace: "test",
-			},
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {},
 		},
 		CurrentContext: "test",
 	}
 
-	registry := test.NewFakeOktetoRegistry(nil)
-	builder := test.NewFakeOktetoBuilder(registry)
-	bc := &OktetoBuilder{
-		Builder:  builder,
-		Registry: registry,
-	}
-	dir, err := createDockerfile()
+	buildRunner := &fakeBuildRunner{}
+	bc := NewBuilder(buildRunner, io.NewIOController())
+	dir, err := createDockerfile(t)
 	assert.NoError(t, err)
-	defer os.RemoveAll(dir)
 
-	tag := "okteto.dev/test"
+	t.Setenv("TEST_VAR", "unit-test")
+	// The missing closing brace breaks the var expansion
+	tag := "okteto.dev/test:${TEST_VAR"
 	options := &types.BuildOptions{
 		CommandArgs: []string{dir},
 		Tag:         tag,
 	}
 	err = bc.Build(ctx, options)
-	// no error from the build
-	assert.NoError(t, err)
-	// the image is at the fake registry
-	image, err := bc.Registry.GetImageTagWithDigest(tag)
-	assert.NoError(t, err)
-	assert.NotEmpty(t, image)
+	// error from the build
+	assert.ErrorAs(t, err, &env.VarExpansionErr{})
+
+	buildRunner.AssertNotCalled(t, "Run", mock.Anything, mock.Anything, mock.Anything)
 }
 
-func TestBuildWithNoErrorFromDockerfileAndNoTag(t *testing.T) {
+func TestBuildWithNoErrorFromDockerfile(t *testing.T) {
 	ctx := context.Background()
-	okteto.CurrentStore = &okteto.OktetoContextStore{
-		Contexts: map[string]*okteto.OktetoContext{
-			"test": {
-				Namespace: "test",
-			},
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {},
 		},
 		CurrentContext: "test",
 	}
 
-	registry := test.NewFakeOktetoRegistry(nil)
-	builder := test.NewFakeOktetoBuilder(registry)
-	bc := &OktetoBuilder{
-		Builder:  builder,
-		Registry: registry,
-	}
-	dir, err := createDockerfile()
+	buildRunner := &fakeBuildRunner{}
+	bc := NewBuilder(buildRunner, io.NewIOController())
+	dir, err := createDockerfile(t)
 	assert.NoError(t, err)
-	defer os.RemoveAll(dir)
+
+	t.Setenv("TEST_VAR", "unit-test")
+	tag := "okteto.dev/test:${TEST_VAR}"
+	options := &types.BuildOptions{
+		CommandArgs: []string{dir},
+		Tag:         tag,
+	}
+
+	expectedOptions := &types.BuildOptions{
+		Path:        dir,
+		File:        filepath.Join(dir, "Dockerfile"),
+		Tag:         "okteto.dev/test:unit-test",
+		CommandArgs: []string{dir},
+	}
+	buildRunner.On("Run", mock.Anything, expectedOptions, mock.Anything).Return(nil)
+
+	err = bc.Build(ctx, options)
+	// no error from the build
+	assert.NoError(t, err)
+
+	buildRunner.AssertExpectations(t)
+}
+
+func TestBuildWithNoErrorFromDockerfileAndNoTag(t *testing.T) {
+	ctx := context.Background()
+
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {},
+		},
+		CurrentContext: "test",
+	}
+	buildRunner := &fakeBuildRunner{}
+	bc := NewBuilder(buildRunner, io.NewIOController())
+	dir, err := createDockerfile(t)
+	assert.NoError(t, err)
 
 	options := &types.BuildOptions{
 		CommandArgs: []string{dir},
 	}
+
+	expectedOptions := &types.BuildOptions{
+		Path:        dir,
+		File:        filepath.Join(dir, "Dockerfile"),
+		CommandArgs: []string{dir},
+	}
+	buildRunner.On("Run", mock.Anything, expectedOptions, mock.Anything).Return(nil)
+
 	err = bc.Build(ctx, options)
 	// no error from the build
 	assert.NoError(t, err)
-	// the image is not at the fake registry
-	image, err := bc.Registry.GetImageTagWithDigest("")
-	assert.ErrorIs(t, err, oktetoErrors.ErrNotFound)
-	assert.Empty(t, image)
+
+	buildRunner.AssertExpectations(t)
 }
 
-func createDockerfile() (string, error) {
-	dir, err := os.MkdirTemp("", "build")
-	if err != nil {
-		return "", err
-	}
+func TestIsV1(t *testing.T) {
+	bc := &OktetoBuilder{}
+	assert.True(t, bc.IsV1())
+}
+
+func createDockerfile(t *testing.T) (string, error) {
+	dir := t.TempDir()
 	dockerfilePath := filepath.Join(dir, "Dockerfile")
-	err = os.WriteFile(dockerfilePath, []byte("Hello"), 0755)
+	err := os.WriteFile(dockerfilePath, []byte("Hello"), 0600)
 	if err != nil {
 		return "", err
 	}

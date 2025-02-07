@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,12 +20,15 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/okteto/okteto/cmd/utils"
 	"github.com/okteto/okteto/pkg/config"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/syncthing"
+)
+
+const (
+	completedProgressValue = 100
 )
 
 // Run runs the "okteto status" sequence
@@ -54,31 +57,31 @@ func getCompletionProgress(ctx context.Context, s *syncthing.Syncthing, local bo
 		return 0, err
 	}
 	if completion.GlobalBytes == 0 {
-		return 100, nil
+		return completedProgressValue, nil
 	}
 	progress := (float64(completion.GlobalBytes-completion.NeedBytes) / float64(completion.GlobalBytes)) * 100
 	return progress, nil
 }
 
 func computeProgress(local, remote float64) float64 {
-	if local == 100 && remote == 100 {
-		return 100
+	if local == completedProgressValue && remote == completedProgressValue {
+		return completedProgressValue
 	}
 
-	if local == 100 {
+	if local == completedProgressValue {
 		return remote
 	}
-	if remote == 100 {
+	if remote == completedProgressValue {
 		return local
 	}
 	return (local + remote) / 2
 }
 
 // Wait waits for the okteto up sequence to finish
-func Wait(ctx context.Context, dev *model.Dev, okStatusList []config.UpState) error {
-	spinner := utils.NewSpinner("Activating your development container...")
-	spinner.Start()
-	defer spinner.Stop()
+func Wait(dev *model.Dev, namespace string, okStatusList []config.UpState) error {
+	oktetoLog.Spinner("Activating your development container...")
+	oktetoLog.StartSpinner()
+	defer oktetoLog.StopSpinner()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
@@ -88,7 +91,7 @@ func Wait(ctx context.Context, dev *model.Dev, okStatusList []config.UpState) er
 
 		ticker := time.NewTicker(500 * time.Millisecond)
 		for {
-			status, err := config.GetState(dev)
+			status, err := config.GetState(dev.Name, namespace)
 			if err != nil {
 				exit <- err
 				return
@@ -110,7 +113,7 @@ func Wait(ctx context.Context, dev *model.Dev, okStatusList []config.UpState) er
 	select {
 	case <-stop:
 		oktetoLog.Infof("CTRL+C received, starting shutdown sequence")
-		spinner.Stop()
+		oktetoLog.StopSpinner()
 		return oktetoErrors.ErrIntSig
 	case err := <-exit:
 		if err != nil {

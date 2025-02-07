@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,30 +17,18 @@ import (
 	"context"
 	"testing"
 
-	contextCMD "github.com/okteto/okteto/cmd/context"
-
-	"github.com/okteto/okteto/internal/test"
 	"github.com/okteto/okteto/internal/test/client"
 	"github.com/okteto/okteto/pkg/okteto"
 	"github.com/okteto/okteto/pkg/types"
 	"github.com/stretchr/testify/assert"
 )
 
-func newFakeContextCommand(c *client.FakeOktetoClient, user *types.User) *contextCMD.ContextCommand {
-	return &contextCMD.ContextCommand{
-		OktetoClientProvider: client.NewFakeOktetoClientProvider(c),
-		K8sClientProvider:    test.NewFakeK8sProvider(nil),
-		LoginController:      test.NewFakeLoginController(user, nil),
-		OktetoContextWriter:  test.NewFakeOktetoContextWriter(),
-	}
-}
-
 func Test_createNamespace(t *testing.T) {
 	ctx := context.Background()
 	var tests = []struct {
+		members *[]string
 		name    string
 		newNs   string
-		members *[]string
 	}{
 		{
 			name:    "create new ns",
@@ -61,11 +49,12 @@ func Test_createNamespace(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			okteto.CurrentStore = &okteto.OktetoContextStore{
-				Contexts: map[string]*okteto.OktetoContext{
+			okteto.CurrentStore = &okteto.ContextStore{
+				Contexts: map[string]*okteto.Context{
 					"test": {
-						Name:  "test",
-						Token: "test",
+						Name:     "test",
+						Token:    "test",
+						IsOkteto: true,
 					},
 				},
 				CurrentContext: "test",
@@ -74,11 +63,11 @@ func Test_createNamespace(t *testing.T) {
 				Token: "test",
 			}
 			fakeOktetoClient := &client.FakeOktetoClient{
-				Namespace: client.NewFakeNamespaceClient([]types.Namespace{{ID: "test"}}, nil),
-				Preview:   client.NewFakePreviewClient(nil, nil),
-				Users:     client.NewFakeUsersClient(usr),
+				Namespace:       client.NewFakeNamespaceClient([]types.Namespace{{ID: "test"}}, nil),
+				Users:           client.NewFakeUsersClient(usr),
+				KubetokenClient: client.NewFakeKubetokenClient(client.FakeKubetokenResponse{}),
 			}
-			nsCmd := &NamespaceCommand{
+			nsCmd := &Command{
 				okClient: fakeOktetoClient,
 				ctxCmd:   newFakeContextCommand(fakeOktetoClient, usr),
 			}
@@ -87,7 +76,7 @@ func Test_createNamespace(t *testing.T) {
 				Namespace: tt.newNs,
 			})
 			assert.Equal(t, nil, err)
-			assert.Equal(t, tt.newNs, okteto.Context().Namespace)
+			assert.Equal(t, tt.newNs, okteto.GetContext().Namespace)
 		})
 	}
 }

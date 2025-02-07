@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,5 +22,5 @@ import (
 // Builder is the interface to build any image
 type Builder interface {
 	Build(ctx context.Context, options *types.BuildOptions) error
-	LoadContext(ctx context.Context, options *types.BuildOptions) error
+	IsV1() bool
 }

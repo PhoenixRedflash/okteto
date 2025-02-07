@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,31 +16,398 @@ package up
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/okteto/okteto/cmd/utils"
+	"github.com/okteto/okteto/pkg/cmd/pipeline"
 	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/env"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/k8s/apps"
-	"github.com/okteto/okteto/pkg/k8s/exec"
+	"github.com/okteto/okteto/pkg/k8s/configmaps"
+	k8sExec "github.com/okteto/okteto/pkg/k8s/exec"
 	"github.com/okteto/okteto/pkg/k8s/pods"
+	"github.com/okteto/okteto/pkg/k8s/secrets"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/registry"
 	"github.com/okteto/okteto/pkg/ssh"
+	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 )
+
+type hybridExecutor struct {
+	workdir string
+	envs    []string
+}
+
+type HybridExecCtx struct {
+	Client    kubernetes.Interface
+	Dev       *model.Dev
+	Workdir   string
+	Name      string
+	Namespace string
+}
+
+// GetCommandToExec returns the command to exec into the hybrid mode
+func (he *hybridExecutor) GetCommandToExec(cmd []string) (*exec.Cmd, error) {
+	var c *exec.Cmd
+	if runtime.GOOS != "windows" {
+		c = exec.Command(cmd[0], cmd[1:]...)
+	} else {
+		binary, err := expandExecutableInCurrentDirectory(cmd[0], he.workdir)
+		if err != nil {
+			return nil, err
+		}
+		c = exec.Command(binary, cmd[1:]...)
+	}
+
+	c.Env = he.envs
+
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+
+	c.Dir = he.workdir
+
+	return c, nil
+}
+
+func (he *hybridExecutor) RunCommand(cmd *exec.Cmd) error {
+	return cmd.Run()
+}
+
+func expandExecutableInCurrentDirectory(args0, dir string) (string, error) {
+	// Works around a restriction added in go1.19 that executables in the
+	// current directory are not resolved when specifying just an executable
+	// name (like e.g. "okteto")
+	if !strings.ContainsRune(args0, os.PathSeparator) {
+		// Check if it's in PATH
+		_, err := exec.LookPath(args0)
+		if err != nil {
+			// Try to get the path to the current executable
+			executable := filepath.Join(dir, args0)
+			_, err := exec.LookPath(executable)
+			if err != nil {
+				return "", fmt.Errorf("could not determine the script file")
+			}
+			return executable, nil
+		}
+	}
+	return args0, nil
+}
+
+type syncExecutor struct {
+	iface      string
+	remotePort int
+}
+
+func (se *syncExecutor) RunCommand(ctx context.Context, cmd []string) error {
+	return ssh.Exec(ctx, se.iface, se.remotePort, true, os.Stdin, os.Stdout, os.Stderr, cmd)
+}
+
+func NewHybridExecutor(ctx context.Context, hybridCtx *HybridExecCtx) (*hybridExecutor, error) {
+	envsGetter, err := newEnvsGetter(hybridCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	envs, err := envsGetter.getEnvs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &hybridExecutor{
+		workdir: hybridCtx.Workdir,
+		envs:    envs,
+	}, nil
+}
+
+func newSyncExecutor(up *upContext) *syncExecutor {
+	return &syncExecutor{
+		iface:      up.Dev.Interface,
+		remotePort: up.Dev.RemotePort,
+	}
+}
+
+type devContainerEnvGetterInterface interface {
+	getEnvsFromDevContainer(ctx context.Context, spec *apiv1.PodSpec, name, namespace string, client kubernetes.Interface) ([]string, error)
+}
+
+type configMapEnvsGetterInterface interface {
+	getEnvsFromConfigMap(ctx context.Context, name string, namespace string, client kubernetes.Interface) ([]string, error)
+}
+
+type platformVariablesEnvsGetterInterface interface {
+	getEnvsFromPlatformVariables(context.Context) ([]string, error)
+}
+
+type imageEnvsGetterInterface interface {
+	getEnvsFromImage(string) ([]string, error)
+}
+
+type imageGetterInterface interface {
+	GetImageMetadata(string) (registry.ImageMetadata, error)
+}
+
+type platformVariablesGetterInterface interface {
+	GetOktetoPlatformVariables(context.Context) ([]env.Var, error)
+}
+
+type devContainerEnvGetter struct{}
+type configMapGetter struct{}
+type platformVariablesEnvsGetter struct {
+	variablesGetter platformVariablesGetterInterface
+}
+type imageEnvsGetter struct {
+	imageGetter imageGetterInterface
+}
+
+type envsGetter struct {
+	client                      kubernetes.Interface
+	devContainerEnvGetter       devContainerEnvGetterInterface
+	configMapEnvsGetter         configMapEnvsGetterInterface
+	platformVariablesEnvsGetter platformVariablesEnvsGetterInterface
+	imageEnvsGetter             imageEnvsGetterInterface
+	dev                         *model.Dev
+	getDefaultLocalEnvs         func() []string
+	name                        string
+	namespace                   string
+}
+
+func newEnvsGetter(hybridCtx *HybridExecCtx) (*envsGetter, error) {
+
+	var variablesGetter platformVariablesGetterInterface
+	if okteto.IsOkteto() {
+		oc, err := okteto.NewOktetoClient()
+		if err != nil {
+			return nil, err
+		}
+		variablesGetter = oc.User()
+	}
+
+	return &envsGetter{
+		dev:                   hybridCtx.Dev,
+		name:                  hybridCtx.Name,
+		namespace:             hybridCtx.Namespace,
+		client:                hybridCtx.Client,
+		devContainerEnvGetter: &devContainerEnvGetter{},
+		configMapEnvsGetter:   &configMapGetter{},
+		platformVariablesEnvsGetter: &platformVariablesEnvsGetter{
+			variablesGetter: variablesGetter,
+		},
+		imageEnvsGetter: &imageEnvsGetter{
+			imageGetter: registry.NewOktetoRegistry(okteto.Config{}),
+		},
+		getDefaultLocalEnvs: getDefaultLocalEnvs,
+	}, nil
+}
+
+func (eg *envsGetter) getEnvs(ctx context.Context) ([]string, error) {
+	var envs []string
+
+	app, err := apps.Get(ctx, eg.dev, eg.namespace, eg.client)
+	if err != nil {
+		return nil, err
+	}
+
+	svcImage := apps.GetDevContainer(app.PodSpec(), "").Image
+	imageEnvs, err := eg.imageEnvsGetter.getEnvsFromImage(svcImage)
+	if err != nil {
+		// we must not fail since the image may not be found because the platform
+		// of the image executed in the pod might not match the local platform used
+		// for the search.
+		reason := fmt.Sprintf("Could not to retrieve environment variables from the image '%s'", svcImage)
+		oktetoLog.Debugf("%s: %s", reason, err.Error())
+		oktetoLog.Warning(reason)
+	}
+	envs = append(envs, imageEnvs...)
+
+	platformVariablesEnvs, err := eg.platformVariablesEnvsGetter.getEnvsFromPlatformVariables(ctx)
+	if err != nil {
+		return nil, err
+	}
+	envs = append(envs, platformVariablesEnvs...)
+
+	configMapEnvs, err := eg.configMapEnvsGetter.getEnvsFromConfigMap(ctx, eg.name, eg.namespace, eg.client)
+	if err != nil {
+		return nil, err
+	}
+	envs = append(envs, configMapEnvs...)
+
+	devContainerEnvs, err := eg.devContainerEnvGetter.getEnvsFromDevContainer(ctx, app.PodSpec(), "", eg.namespace, eg.client)
+	if err != nil {
+		return nil, err
+	}
+	envs = append(envs, devContainerEnvs...)
+
+	envs = append(envs, eg.getDefaultLocalEnvs()...)
+
+	for _, env := range eg.dev.Environment {
+		envs = append(envs, fmt.Sprintf("%s=%s", env.Name, env.Value))
+	}
+
+	return envs, nil
+}
+
+func getDefaultLocalEnvs() []string {
+	var envs []string
+
+	path := os.Getenv("PATH")
+	if path != "" {
+		envs = append(envs, fmt.Sprintf("PATH=%s", path))
+	}
+
+	term := os.Getenv("TERM")
+	if term != "" {
+		envs = append(envs, fmt.Sprintf("TERM=%s", term))
+	}
+
+	return envs
+}
+
+func (d *devContainerEnvGetter) getEnvsFromDevContainer(ctx context.Context, spec *apiv1.PodSpec, name, namespace string, client kubernetes.Interface) ([]string, error) {
+	var envs []string
+
+	devContainer := apps.GetDevContainer(spec, name)
+
+	for _, env := range devContainer.Env {
+		val := env.Value
+		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+			secret, err := secrets.Get(ctx, env.ValueFrom.SecretKeyRef.Name, namespace, client)
+			if err != nil {
+				return envs, fmt.Errorf("%w: the development container didn't start successfully because the kubernetes secret '%s' was not found", err, env.ValueFrom.SecretKeyRef.Name)
+			}
+			val = string(secret.Data[env.ValueFrom.SecretKeyRef.Key])
+		}
+
+		if env.ValueFrom != nil && env.ValueFrom.ConfigMapKeyRef != nil {
+			cm, err := configmaps.Get(ctx, env.ValueFrom.ConfigMapKeyRef.Name, namespace, client)
+			if err != nil {
+				return envs, fmt.Errorf("%w: the development container didn't start successfully because the kubernetes configmap '%s' was not found", err, env.ValueFrom.ConfigMapKeyRef.Name)
+			}
+			val = cm.Data[env.ValueFrom.ConfigMapKeyRef.Key]
+		}
+		envs = append(envs, fmt.Sprintf("%s=%s", env.Name, val))
+	}
+
+	for _, envFromSource := range devContainer.EnvFrom {
+		if envFromSource.ConfigMapRef != nil {
+			cm, err := configmaps.Get(ctx, envFromSource.ConfigMapRef.Name, namespace, client)
+			if err != nil {
+				return envs, fmt.Errorf("%w: the development container didn't start successfully because the kubernetes configmap '%s' was not found", err, envFromSource.ConfigMapRef.Name)
+			}
+			for k, v := range cm.Data {
+				envs = append(envs, fmt.Sprintf("%s=%s", k, v))
+			}
+		}
+		if envFromSource.SecretRef != nil {
+			secret, err := secrets.Get(ctx, envFromSource.SecretRef.Name, namespace, client)
+			if err != nil {
+				return envs, fmt.Errorf("%w: the development container didn't start successfully because the kubernetes secret '%s' was not found", err, envFromSource.SecretRef.Name)
+			}
+			for k, v := range secret.Data {
+				envs = append(envs, fmt.Sprintf("%s=%s", k, string(v)))
+			}
+		}
+	}
+
+	return envs, nil
+}
+
+func (cmg *configMapGetter) getEnvsFromConfigMap(ctx context.Context, name, namespace string, client kubernetes.Interface) ([]string, error) {
+	var envs []string
+
+	cmName := pipeline.TranslatePipelineName(name)
+	devCmap, err := configmaps.Get(ctx, cmName, namespace, client)
+	if err != nil && !oktetoErrors.IsNotFound(err) {
+		return nil, err
+	}
+
+	if devCmap != nil && devCmap.Data != nil {
+		if devVariables, ok := devCmap.Data[constants.OktetoConfigMapVariablesField]; ok {
+			envInConfigMap := []map[string]string{}
+			decodedEnvs, err := base64.StdEncoding.DecodeString(devVariables)
+			if err != nil {
+				return nil, err
+			}
+			err = json.Unmarshal(decodedEnvs, &envInConfigMap)
+			if err != nil {
+				return nil, err
+			}
+			for _, envKeyValue := range envInConfigMap {
+				for k, v := range envKeyValue {
+					envs = append(envs, fmt.Sprintf("%s=%s", k, v))
+				}
+			}
+		}
+	}
+
+	return envs, nil
+}
+
+func (sg *platformVariablesEnvsGetter) getEnvsFromPlatformVariables(ctx context.Context) ([]string, error) {
+	var envs []string
+
+	if okteto.IsOkteto() {
+		variables, err := sg.variablesGetter.GetOktetoPlatformVariables(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, v := range variables {
+			envs = append(envs, fmt.Sprintf("%s=%s", v.Name, v.Value))
+		}
+	}
+
+	return envs, nil
+}
+
+func (ig *imageEnvsGetter) getEnvsFromImage(imageTag string) ([]string, error) {
+	var envs []string
+
+	imageMetadata, err := ig.imageGetter.GetImageMetadata(imageTag)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, env := range imageMetadata.Envs {
+		if strings.HasPrefix(env, "PATH=") {
+			continue
+		}
+		envs = append(envs, env)
+
+	}
+
+	return envs, nil
+}
 
 func (up *upContext) cleanCommand(ctx context.Context) {
 	in := strings.NewReader("\n")
 	var out bytes.Buffer
 
-	cmd := "cat /var/okteto/bin/version.txt; cat /proc/sys/fs/inotify/max_user_watches; /var/okteto/bin/clean >/dev/null 2>&1"
+	cmd := "cat /proc/sys/fs/inotify/max_user_watches; /var/okteto/bin/clean >/dev/null 2>&1"
 
-	err := exec.Exec(
+	k8sClient, restConfig, err := up.K8sClientProvider.Provide(okteto.GetContext().Cfg)
+	if err != nil {
+		oktetoLog.Infof("failed to clean session: %s", err)
+		return
+	}
+
+	err = k8sExec.Exec(
 		ctx,
-		up.Client,
-		up.RestConfig,
-		up.Dev.Namespace,
+		k8sClient,
+		restConfig,
+		up.Namespace,
 		up.Pod.Name,
 		up.Dev.Container,
 		false,
@@ -57,21 +424,51 @@ func (up *upContext) cleanCommand(ctx context.Context) {
 	up.cleaned <- out.String()
 }
 
-func (up *upContext) runCommand(ctx context.Context, cmd []string) error {
+func (up *upContext) RunCommand(ctx context.Context, cmd []string) error {
 	oktetoLog.Infof("starting remote command")
-	if err := config.UpdateStateFile(up.Dev, config.Ready); err != nil {
+	if err := config.UpdateStateFile(up.Dev.Name, up.Namespace, config.Ready); err != nil {
+		return err
+	}
+
+	k8sClient, restConfig, err := up.K8sClientProvider.Provide(okteto.GetContext().Cfg)
+	if err != nil {
 		return err
 	}
 
 	if up.Dev.RemoteModeEnabled() {
-		return ssh.Exec(ctx, up.Dev.Interface, up.Dev.RemotePort, true, os.Stdin, os.Stdout, os.Stderr, cmd)
+		if up.Dev.IsHybridModeEnabled() {
+			hybridCtx := &HybridExecCtx{
+				Dev:       up.Dev,
+				Name:      up.Manifest.Name,
+				Namespace: up.Namespace,
+				Client:    k8sClient,
+				Workdir:   up.Dev.Workdir,
+			}
+			executor, err := NewHybridExecutor(ctx, hybridCtx)
+			if err != nil {
+				return err
+			}
+
+			cmd, err := executor.GetCommandToExec(cmd)
+			if err != nil {
+				return err
+			}
+
+			up.hybridCommand = cmd
+
+			return executor.RunCommand(cmd)
+		} else {
+			executor := newSyncExecutor(up)
+			return executor.RunCommand(ctx, cmd)
+		}
+
 	}
 
-	return exec.Exec(
+	return k8sExec.Exec(
 		ctx,
-		up.Client,
-		up.RestConfig,
-		up.Dev.Namespace,
+		k8sClient,
+		restConfig,
+		up.Namespace,
 		up.Pod.Name,
 		up.Dev.Container,
 		true,
@@ -83,42 +480,47 @@ func (up *upContext) runCommand(ctx context.Context, cmd []string) error {
 }
 
 func (up *upContext) checkOktetoStartError(ctx context.Context, msg string) error {
-	app, err := apps.Get(ctx, up.Dev, up.Dev.Namespace, up.Client)
+	k8sClient, _, err := up.K8sClientProvider.Provide(okteto.GetContext().Cfg)
+	if err != nil {
+		return err
+	}
+
+	app, err := apps.Get(ctx, up.Dev, up.Namespace, k8sClient)
 	if err != nil {
 		return err
 	}
 
 	devApp := app.DevClone()
-	if err := devApp.Refresh(ctx, up.Client); err != nil {
+	if err := devApp.Refresh(ctx, k8sClient); err != nil {
 		return err
 	}
-	pod, err := devApp.GetRunningPod(ctx, up.Client)
+	pod, err := devApp.GetRunningPod(ctx, k8sClient)
 	if err != nil {
 		return err
 	}
 
-	userID := pods.GetPodUserID(ctx, pod.Name, up.Dev.Container, up.Dev.Namespace, up.Client)
+	userID := pods.GetPodUserID(ctx, pod.Name, up.Dev.Container, up.Namespace, k8sClient)
 	if up.Dev.PersistentVolumeEnabled() {
 		if userID != -1 && userID != *up.Dev.SecurityContext.RunAsUser {
 			return oktetoErrors.UserError{
 				E: fmt.Errorf("User %d doesn't have write permissions for synchronization paths", userID),
 				Hint: fmt.Sprintf(`Set 'securityContext.runAsUser: %d' in your okteto manifest.
-	After that, run '%s' to reset your development container and run 'okteto up' again`, userID, utils.GetDownCommand(up.Options.DevPath)),
+	After that, run '%s' to reset your development container and run 'okteto up' again`, userID, utils.GetDownCommand(up.Options.ManifestPathFlag)),
 			}
 		}
 	}
 
 	if len(up.Dev.Secrets) > 0 {
 		return oktetoErrors.UserError{
-			E: fmt.Errorf(msg),
+			E: fmt.Errorf("%s", msg),
 			Hint: fmt.Sprintf(`Check your development container logs for errors: 'kubectl logs %s',
 	Check that your container can write to the destination path of your secrets.
-	Run '%s' to reset your development container and try again`, up.Pod.Name, utils.GetDownCommand(up.Options.DevPath)),
+	Run '%s' to reset your development container and try again`, up.Pod.Name, utils.GetDownCommand(up.Options.ManifestPathFlag)),
 		}
 	}
 	return oktetoErrors.UserError{
-		E: fmt.Errorf(msg),
+		E: fmt.Errorf("%s", msg),
 		Hint: fmt.Sprintf(`Check your development container logs for errors: 'kubectl logs %s'.
-    Run '%s' to reset your development container and try again`, up.Pod.Name, utils.GetDownCommand(up.Options.DevPath)),
+    Run '%s' to reset your development container and try again`, up.Pod.Name, utils.GetDownCommand(up.Options.ManifestPathFlag)),
 	}
 }

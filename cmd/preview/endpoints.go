@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,9 +14,11 @@
 package preview
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -24,7 +26,6 @@ import (
 	"github.com/okteto/okteto/cmd/utils"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/okteto"
 	"github.com/spf13/cobra"
 )
@@ -32,29 +33,33 @@ import (
 // Endpoints show all the endpoints of a preview environment
 func Endpoints(ctx context.Context) *cobra.Command {
 	var output string
+	var k8sContext string
 
 	cmd := &cobra.Command{
 		Use:   "endpoints <name>",
-		Short: "Show endpoints for a preview environment",
+		Short: "List the endpoints of a Preview Environment",
 		Args:  utils.ExactArgsAccepted(1, ""),
 		RunE: func(cmd *cobra.Command, args []string) error {
-
 			previewName := args[0]
 
-			ctxResource := &model.ContextResource{}
-			if err := ctxResource.UpdateNamespace(previewName); err != nil {
-				return err
+			jsonContextBuffer := bytes.NewBuffer([]byte{})
+			if output == "json" {
+				oktetoLog.SetOutput(jsonContextBuffer)
 			}
 
-			ctxOptions := &contextCMD.ContextOptions{
-				Namespace: ctxResource.Namespace,
-			}
-			if err := contextCMD.NewContextCommand().Run(ctx, ctxOptions); err != nil {
+			if err := contextCMD.NewContextCommand().Run(ctx, &contextCMD.Options{Namespace: previewName, Context: k8sContext}); err != nil {
 				return err
 			}
 
 			if !okteto.IsOkteto() {
 				return oktetoErrors.ErrContextIsNotOktetoCluster
+			}
+
+			if output != "json" {
+				oktetoLog.Information("Using %s @ %s as context", previewName, okteto.RemoveSchema(okteto.GetContext().Name))
+			} else {
+				oktetoLog.Info(jsonContextBuffer.String())
+				oktetoLog.SetOutput(os.Stdout)
 			}
 
 			if err := validateOutput(output); err != nil {
@@ -64,6 +69,7 @@ func Endpoints(ctx context.Context) *cobra.Command {
 			return err
 		},
 	}
+	cmd.Flags().StringVarP(&k8sContext, "context", "c", "", "overwrite the current Okteto Context")
 	cmd.Flags().StringVarP(&output, "output", "o", "", "output format. One of: ['json', 'md']")
 
 	return cmd
@@ -83,9 +89,9 @@ func executeListPreviewEndpoints(ctx context.Context, name, output string) error
 	if err != nil {
 		return err
 	}
-	endpointList, err := oktetoClient.ListPreviewsEndpoints(ctx, name)
+	endpointList, err := oktetoClient.Previews().ListEndpoints(ctx, name)
 	if err != nil {
-		return fmt.Errorf("failed to get preview environments: %s", err)
+		return fmt.Errorf("failed to get preview environments: %w", err)
 	}
 
 	switch output {

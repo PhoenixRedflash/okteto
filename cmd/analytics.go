@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,11 +20,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-//Analytics turns analytics on/off
+// Analytics turns analytics on/off
 func Analytics() *cobra.Command {
 	var disable bool
 	cmd := &cobra.Command{
-		Args:  utils.NoArgsAccepted("https://okteto.com/docs/reference/cli/#analytics"),
+		Args:  utils.NoArgsAccepted("https://okteto.com/docs/reference/okteto-cli/#analytics"),
 		Use:   "analytics",
 		Short: "Enable / Disable analytics",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -35,7 +35,7 @@ func Analytics() *cobra.Command {
 			return enableAnalytics()
 		},
 	}
-	cmd.Flags().BoolVarP(&disable, "disable", "d", false, "disable analytics")
+	cmd.Flags().BoolVarP(&disable, "disable", "d", false, "disable analytic collection")
 	return cmd
 }
 
