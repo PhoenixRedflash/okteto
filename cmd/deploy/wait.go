@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,25 +20,37 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/okteto/okteto/cmd/utils"
 	"github.com/okteto/okteto/pkg/cmd/pipeline"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/k8s/deployments"
 	"github.com/okteto/okteto/pkg/k8s/statefulsets"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
+	ioCtrl "github.com/okteto/okteto/pkg/log/io"
 	"github.com/okteto/okteto/pkg/okteto"
 )
 
-func (dc *DeployCommand) wait(ctx context.Context, opts *Options) error {
-	spinner := utils.NewSpinner(fmt.Sprintf("Waiting for %s to be deployed...", opts.Name))
-	spinner.Start()
-	defer spinner.Stop()
+type Waiter struct {
+	K8sClientProvider okteto.K8sClientProviderWithLogger
+	K8sLogger         *ioCtrl.K8sLogger
+}
+
+func NewDeployWaiter(k8sClientProvider okteto.K8sClientProviderWithLogger, k8slogger *ioCtrl.K8sLogger) Waiter {
+	return Waiter{
+		K8sClientProvider: k8sClientProvider,
+		K8sLogger:         k8slogger,
+	}
+}
+
+func (dw *Waiter) wait(ctx context.Context, opts *Options) error {
+	oktetoLog.Spinner(fmt.Sprintf("Waiting for %s to be deployed...", opts.Name))
+	oktetoLog.StartSpinner()
+	defer oktetoLog.StopSpinner()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 	exit := make(chan error, 1)
 	go func() {
-		exit <- dc.waitForResourcesToBeRunning(ctx, opts)
+		exit <- dw.waitForResourcesToBeRunning(ctx, opts)
 	}()
 	select {
 	case <-stop:
@@ -54,10 +66,10 @@ func (dc *DeployCommand) wait(ctx context.Context, opts *Options) error {
 	return nil
 }
 
-func (dc *DeployCommand) waitForResourcesToBeRunning(ctx context.Context, opts *Options) error {
+func (dw *Waiter) waitForResourcesToBeRunning(ctx context.Context, opts *Options) error {
 	ticker := time.NewTicker(5 * time.Second)
 	to := time.NewTicker(opts.Timeout)
-	c, _, err := dc.K8sClientProvider.Provide(okteto.Context().Cfg)
+	c, _, err := dw.K8sClientProvider.ProvideWithLogger(okteto.GetContext().Cfg, dw.K8sLogger)
 	if err != nil {
 		return err
 	}
@@ -65,27 +77,30 @@ func (dc *DeployCommand) waitForResourcesToBeRunning(ctx context.Context, opts *
 	for {
 		select {
 		case <-to.C:
-			return fmt.Errorf("'%s' deploy didn't finish after %s", opts.Manifest.Name, opts.Timeout.String())
+			return fmt.Errorf("'%s' resources where not healthy after %s", opts.Manifest.Name, opts.Timeout.String())
 		case <-ticker.C:
-			dList, err := pipeline.ListDeployments(ctx, opts.Manifest.Name, opts.Manifest.Namespace, c)
+			ns := okteto.GetContext().Namespace
+			dList, err := pipeline.ListDeployments(ctx, opts.Manifest.Name, ns, c)
 			if err != nil {
 				return err
 			}
 			areAllRunning := true
-			for _, d := range dList {
-				if !deployments.IsRunning(ctx, opts.Manifest.Namespace, d.Name, c) {
+			for i := range dList {
+				d := &dList[i]
+				if !deployments.IsRunning(ctx, ns, d.Name, c) {
 					areAllRunning = false
 				}
 			}
 			if !areAllRunning {
 				continue
 			}
-			sfsList, err := pipeline.ListStatefulsets(ctx, opts.Manifest.Name, opts.Manifest.Namespace, c)
+			sfsList, err := pipeline.ListStatefulsets(ctx, opts.Manifest.Name, ns, c)
 			if err != nil {
 				return err
 			}
-			for _, sfs := range sfsList {
-				if !statefulsets.IsRunning(ctx, opts.Manifest.Namespace, sfs.Name, c) {
+			for i := range sfsList {
+				ss := &sfsList[i]
+				if !statefulsets.IsRunning(ctx, ns, ss.Name, c) {
 					areAllRunning = false
 				}
 			}

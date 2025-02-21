@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,54 +15,79 @@ package v2
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
-	"github.com/okteto/okteto/pkg/cmd/build"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
-	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
-	"github.com/okteto/okteto/pkg/okteto"
-	"github.com/okteto/okteto/pkg/registry"
-	"github.com/okteto/okteto/pkg/types"
 	"golang.org/x/sync/errgroup"
 )
 
-// GetServicesToBuild returns the services it has to built because they are not already built
-func (bc *OktetoBuilder) GetServicesToBuild(ctx context.Context, manifest *model.Manifest, svcToDeploy []string) ([]string, error) {
+var (
+	// ErrImageIsNotAOktetoBuildSyntax is returned when the image is not an okteto build syntax
+	ErrImageIsNotAOktetoBuildSyntax = errors.New("image is not an okteto build syntax")
+
+	// ErrOktetBuildSyntaxImageIsNotInBuildSection is returned when the image is not in the build section
+	ErrOktetBuildSyntaxImageIsNotInBuildSection = errors.New("image is not in the build section")
+)
+
+// GetServicesToBuildDuringExecution returns the services it has to build if they are not already built
+// this function is called from outside the build cmd and during a "deploy operation" (up, deploy, destroy, compose).
+func (bc *OktetoBuilder) GetServicesToBuildDuringExecution(ctx context.Context, manifest *model.Manifest, svcsToDeploy []string) ([]string, error) {
 	buildManifest := manifest.Build
 
+	if len(buildManifest) == 0 {
+		return nil, nil
+	}
+
+	// create a spinner to be loaded before checking if images needs to be built
+	sp := bc.ioCtrl.Out().Spinner("Checking images to build...")
+	sp.Start()
+	defer sp.Stop()
+
+	svcToDeployMap := map[string]bool{}
+	if len(svcsToDeploy) == 0 {
+		for svc := range buildManifest {
+			svcToDeployMap[svc] = true
+		}
+	} else {
+		for _, svcToDeploy := range svcsToDeploy {
+			svcToDeployMap[svcToDeploy] = true
+		}
+	}
 	// check if images are at registry (global or dev) and set envs or send to build
-	toBuild := make(chan string, len(buildManifest))
+	toBuildCh := make(chan string, len(svcToDeployMap))
 	g, _ := errgroup.WithContext(ctx)
 	for service := range buildManifest {
-
+		if _, ok := svcToDeployMap[service]; !ok {
+			bc.ioCtrl.Logger().Debugf("Skipping service '%s' because it is not in the list of services to deploy", service)
+			continue
+		}
 		svc := service
+
 		g.Go(func() error {
-			return bc.checkServicesToBuild(svc, manifest, toBuild)
+			return bc.checkServiceToBuildDuringDeploy(svc, manifest, toBuildCh)
 		})
 	}
 
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-	close(toBuild)
+	close(toBuildCh)
 
-	if len(toBuild) == 0 {
-		oktetoLog.Information("Images were already built. To rebuild your images run 'okteto build' or 'okteto deploy --build'")
+	if len(toBuildCh) == 0 {
+		bc.ioCtrl.Out().Infof("Images were already built. To rebuild your images run 'okteto build'")
 		if err := manifest.ExpandEnvVars(); err != nil {
 			return nil, err
 		}
 		return nil, nil
 	}
 
-	svcToDeployMap := map[string]bool{}
-	for _, svc := range svcToDeploy {
-		svcToDeployMap[svc] = true
-	}
 	svcsToBuildList := []string{}
-	for svc := range toBuild {
-		if _, ok := svcToDeployMap[svc]; len(svcToDeploy) > 0 && !ok {
+	for svc := range toBuildCh {
+		if _, ok := svcToDeployMap[svc]; len(svcsToDeploy) > 0 && !ok {
 			continue
 		}
 		svcsToBuildList = append(svcsToBuildList, svc)
@@ -70,26 +95,30 @@ func (bc *OktetoBuilder) GetServicesToBuild(ctx context.Context, manifest *model
 	return svcsToBuildList, nil
 }
 
-func (bc *OktetoBuilder) checkServicesToBuild(service string, manifest *model.Manifest, ch chan string) error {
+// checkServiceToBuildDuringDeploy looks for the service image reference at the registry and adds it to the buildCh
+// if is not found. This function is called during deploy operations (up, deploy, destroy and compose) to check if
+// images have to be built or not. In that case, we only check the existence of "okteto" tag in the dev registry
+func (bc *OktetoBuilder) checkServiceToBuildDuringDeploy(service string, manifest *model.Manifest, buildCh chan string) error {
 	buildInfo := manifest.Build[service].Copy()
 	isStack := manifest.Type == model.StackType
-	if isStack && okteto.IsOkteto() && !registry.IsOktetoRegistry(buildInfo.Image) {
+	if isStack && bc.oktetoContext.IsOktetoCluster() && !bc.Registry.IsOktetoRegistry(buildInfo.Image) {
 		buildInfo.Image = ""
 	}
-	opts := build.OptsFromBuildInfo(manifest.Name, service, buildInfo, &types.BuildOptions{})
-	if opts.Tag == "" {
-		return fmt.Errorf("error getting the image name for the service '%s'. Please specify the full name of the image when using a Kubernetes namespace not managed by Okteto", service)
-	}
 
-	imageWithDigest, err := bc.Registry.GetImageTagWithDigest(opts.Tag)
+	imageChecker := getImageChecker(bc.Config, bc.Registry, bc.smartBuildCtrl, bc.ioCtrl.Logger())
+	imageWithDigest, err := imageChecker.getImageDigestReferenceForServiceDeploy(manifest.Name, service, buildInfo)
 	if oktetoErrors.IsNotFound(err) {
-		oktetoLog.Debug("image not found, building image")
-		ch <- service
+		bc.ioCtrl.Logger().Debug("image not found, building image")
+		buildCh <- service
 		return nil
 	} else if err != nil {
-		return fmt.Errorf("error checking image at registry %s: %v", opts.Tag, err)
+		bc.ioCtrl.Out().Warning("could not verify if image for service %q is already in the registry. Building image...", service)
+		// If there is an error trying to get the image from the registry, we just rebuild that image
+		bc.ioCtrl.Logger().Debugf("unexpected error checking if the images exist: %s", err)
+		buildCh <- service
+		return nil
 	}
-	oktetoLog.Debug("Skipping build for image for service")
+	bc.ioCtrl.Logger().Debugf("Skipping build for image for service: %s", service)
 
 	bc.SetServiceEnvVars(service, imageWithDigest)
 
@@ -100,4 +129,30 @@ func (bc *OktetoBuilder) checkServicesToBuild(service string, manifest *model.Ma
 		}
 	}
 	return nil
+}
+
+func (bc *OktetoBuilder) GetSvcToBuildFromRegex(manifest *model.Manifest, imgFinder model.ImageFromManifest) (string, error) {
+	img := imgFinder(manifest)
+	reg := regexp.MustCompile(`OKTETO_BUILD_(\w+)_`)
+	matches := reg.FindStringSubmatch(img)
+	foundMatches := 2
+	if len(matches) == 0 {
+		return "", ErrImageIsNotAOktetoBuildSyntax
+	}
+
+	sanitisedToUnsanitised := map[string]string{}
+	for buildSvc := range manifest.Build {
+		sanitizedSvc := strings.ToUpper(strings.ReplaceAll(buildSvc, "-", "_"))
+		sanitisedToUnsanitised[sanitizedSvc] = buildSvc
+	}
+	if len(matches) != foundMatches {
+		return "", ErrImageIsNotAOktetoBuildSyntax
+	}
+	sanitisedName := matches[1]
+	svc, ok := sanitisedToUnsanitised[sanitisedName]
+	if !ok {
+		return "", ErrOktetBuildSyntaxImageIsNotInBuildSection
+	}
+
+	return svc, nil
 }

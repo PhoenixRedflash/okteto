@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,91 +21,101 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/compose-spec/godotenv"
+	"github.com/okteto/okteto/pkg/build"
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/discovery"
+	"github.com/okteto/okteto/pkg/env"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/filesystem"
+	"github.com/okteto/okteto/pkg/format"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	yaml "gopkg.in/yaml.v2"
+	"github.com/okteto/okteto/pkg/model/forward"
+	"github.com/okteto/okteto/pkg/model/utils"
+	"github.com/spf13/afero"
+	"gopkg.in/yaml.v2"
 	apiv1 "k8s.io/api/core/v1"
-	resource "k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/api/resource"
+)
+
+const (
+	// stacksSupportEnabledEnvVar is the environment variable to know if we should use compose or stacks
+	stackSupportEnabledEnvVar = "OKTETO_SUPPORT_STACKS_ENABLED"
+	// defaultValueStackSupportEnabledEnvVar is the default value for stackSupportEnabledEnvVar
+	defaultValueStackSupportEnabledEnvVar = false
 )
 
 var (
-	errBadStackName = "must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character"
-	//DefaultStackManifest default okteto stack manifest file
-	possibleStackManifests = [][]string{
-		{"okteto-stack.yml"},
-		{"okteto-stack.yaml"},
-		{"stack.yml"},
-		{"stack.yaml"},
-		{".okteto", "okteto-stack.yml"},
-		{".okteto", "okteto-stack.yaml"},
-		{"okteto-compose.yml"},
-		{"okteto-compose.yaml"},
-		{".okteto", "okteto-compose.yml"},
-		{".okteto", "okteto-compose.yaml"},
-		{"docker-compose.yml"},
-		{"docker-compose.yaml"},
-		{".okteto", "docker-compose.yml"},
-		{".okteto", "docker-compose.yaml"},
-	}
+	errBadStackName     = "must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character"
 	deprecatedManifests = []string{"stack.yml", "stack.yaml"}
+	errDependsOn        = errors.New("invalid depends_on")
+
+	stackDeprecationWarningOnce = sync.Once{}
 )
 
 // Stack represents an okteto stack
 type Stack struct {
-	Manifest  []byte                 `yaml:"-"`
-	Paths     []string               `yaml:"-"`
-	Warnings  StackWarnings          `yaml:"-"`
-	IsCompose bool                   `yaml:"-"`
-	Name      string                 `yaml:"name"`
 	Volumes   map[string]*VolumeSpec `yaml:"volumes,omitempty"`
+	Services  ComposeServices        `yaml:"services,omitempty"`
+	Endpoints EndpointSpec           `yaml:"endpoints,omitempty"`
+	Name      string                 `yaml:"name"`
 	Namespace string                 `yaml:"namespace,omitempty"`
 	Context   string                 `yaml:"context,omitempty"`
-	Services  map[string]*Service    `yaml:"services,omitempty"`
-	Endpoints EndpointSpec           `yaml:"endpoints,omitempty"`
+	Warnings  StackWarnings          `yaml:"-"`
+	Manifest  []byte                 `yaml:"-"`
+	Paths     []string               `yaml:"-"`
+	IsCompose bool                   `yaml:"-"`
+}
+
+// ComposeServices represents the services declared in the compose
+type ComposeServices map[string]*Service
+
+func (cs ComposeServices) getNames() []string {
+	names := []string{}
+	for k := range cs {
+		names = append(names, k)
+	}
+	return names
 }
 
 // Service represents an okteto stack service
 type Service struct {
-	Build      *BuildInfo         `yaml:"build,omitempty"`
-	CapAdd     []apiv1.Capability `yaml:"cap_add,omitempty"`
-	CapDrop    []apiv1.Capability `yaml:"cap_drop,omitempty"`
-	Entrypoint Entrypoint         `yaml:"entrypoint,omitempty"`
-	Command    Command            `yaml:"command,omitempty"`
-	EnvFiles   EnvFiles           `yaml:"env_file,omitempty"`
-	DependsOn  DependsOn          `yaml:"depends_on,omitempty"`
+	Healtcheck    *HealthCheck          `yaml:"healthcheck,omitempty"`
+	Labels        Labels                `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Resources     *StackResources       `yaml:"resources,omitempty"` // For okteto stack only
+	NodeSelector  Selector              `json:"x-node-selector,omitempty" yaml:"x-node-selector,omitempty"`
+	User          *StackSecurityContext `yaml:"user,omitempty"`
+	DependsOn     DependsOn             `yaml:"depends_on,omitempty"`
+	Build         *build.Info           `yaml:"build,omitempty"`
+	Workdir       string                `yaml:"workdir,omitempty"`
+	Image         string                `yaml:"image,omitempty"`
+	RestartPolicy apiv1.RestartPolicy   `yaml:"restart,omitempty"`
 
-	Environment     Environment           `yaml:"environment,omitempty"`
-	Image           string                `yaml:"image,omitempty"`
-	Labels          Labels                `json:"labels,omitempty" yaml:"labels,omitempty"`
-	Annotations     Annotations           `json:"annotations,omitempty" yaml:"annotations,omitempty"`
-	Ports           []Port                `yaml:"ports,omitempty"`
-	RestartPolicy   apiv1.RestartPolicy   `yaml:"restart,omitempty"`
-	StopGracePeriod int64                 `yaml:"stop_grace_period,omitempty"`
-	Volumes         []StackVolume         `yaml:"volumes,omitempty"`
-	Workdir         string                `yaml:"workdir,omitempty"`
-	BackOffLimit    int32                 `yaml:"max_attempts,omitempty"`
-	Healtcheck      *HealthCheck          `yaml:"healthcheck,omitempty"`
-	User            *StackSecurityContext `yaml:"user,omitempty"`
+	Environment     env.Environment      `yaml:"environment,omitempty"`
+	Ports           []Port               `yaml:"ports,omitempty"`
+	Volumes         []build.VolumeMounts `yaml:"volumes,omitempty"`
+	CapAdd          []apiv1.Capability   `yaml:"cap_add,omitempty"`
+	CapDrop         []apiv1.Capability   `yaml:"cap_drop,omitempty"`
+	VolumeMounts    []build.VolumeMounts `yaml:"-"`
+	EnvFiles        env.Files            `yaml:"env_file,omitempty"`
+	Command         Command              `yaml:"command,omitempty"`
+	Annotations     Annotations          `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	Entrypoint      Entrypoint           `yaml:"entrypoint,omitempty"`
+	StopGracePeriod int64                `yaml:"stop_grace_period,omitempty"`
 
-	// Fields only for okteto stacks
-	Public    bool            `yaml:"public,omitempty"`
-	Replicas  int32           `yaml:"replicas,omitempty"`
-	Resources *StackResources `yaml:"resources,omitempty"`
+	Replicas     int32 `yaml:"replicas,omitempty"` // For okteto stack only
+	BackOffLimit int32 `yaml:"max_attempts,omitempty"`
 
-	VolumeMounts []StackVolume `yaml:"-"`
+	Public bool `yaml:"public,omitempty"` // For okteto stack only
 }
 
 // StackSecurityContext defines which user and group use
 type StackSecurityContext struct {
 	RunAsUser  *int64 `json:"runAsUser,omitempty" yaml:"runAsUser,omitempty"`
 	RunAsGroup *int64 `json:"runAsGroup,omitempty" yaml:"runAsGroup,omitempty"`
-}
-type StackVolume struct {
-	LocalPath  string
-	RemotePath string
 }
 
 type VolumeSpec struct {
@@ -115,7 +125,7 @@ type VolumeSpec struct {
 	Class       string      `json:"class,omitempty" yaml:"class,omitempty"`
 }
 type Envs struct {
-	List Environment
+	List env.Environment
 }
 type HealthCheck struct {
 	HTTP        *HTTPHealtcheck `yaml:"http,omitempty"`
@@ -125,6 +135,8 @@ type HealthCheck struct {
 	Retries     int             `yaml:"retries,omitempty"`
 	StartPeriod time.Duration   `yaml:"start_period,omitempty"`
 	Disable     bool            `yaml:"disable,omitempty"`
+	Liveness    bool            `yaml:"x-okteto-liveness,omitempty"`
+	Readiness   bool            `default:"true" yaml:"x-okteto-readiness,omitempty"`
 }
 
 type HTTPHealtcheck struct {
@@ -158,15 +170,25 @@ type Quantity struct {
 	Value resource.Quantity
 }
 
+type PortInterface interface {
+	GetHostPort() int32
+	GetContainerPort() int32
+	GetProtocol() apiv1.Protocol
+}
+
 type Port struct {
+	Protocol      apiv1.Protocol
 	HostPort      int32
 	ContainerPort int32
-	Protocol      apiv1.Protocol
 }
+
+func (p Port) GetHostPort() int32          { return p.HostPort }
+func (p Port) GetContainerPort() int32     { return p.ContainerPort }
+func (p Port) GetProtocol() apiv1.Protocol { return p.Protocol }
 
 type EndpointSpec map[string]Endpoint
 
-// Endpoints represents an okteto stack ingress
+// Endpoint represents an okteto stack ingress
 type Endpoint struct {
 	Labels      Labels         `json:"labels,omitempty" yaml:"labels,omitempty"`
 	Annotations Annotations    `json:"annotations,omitempty" yaml:"annotations,omitempty"`
@@ -212,23 +234,31 @@ const (
 )
 
 // GetStackFromPath returns an okteto stack object from a given file
-func GetStackFromPath(name, stackPath string, isCompose bool) (*Stack, error) {
+func GetStackFromPath(name, stackPath string, isCompose bool, fs afero.Fs) (*Stack, error) {
 	b, err := os.ReadFile(stackPath)
 	if err != nil {
 		return nil, err
+	}
+
+	if isEmptyManifestFile(b) {
+		return nil, fmt.Errorf("%w: %s", oktetoErrors.ErrInvalidManifest, oktetoErrors.ErrEmptyManifest)
 	}
 
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
-	defer os.Chdir(cwd)
+	defer func() {
+		if err := os.Chdir(cwd); err != nil {
+			oktetoLog.Infof("failed to change directory to %s: %s", cwd, err)
+		}
+	}()
 
-	stackWorkingDir := GetWorkdirFromManifestPath(stackPath)
+	stackWorkingDir := filesystem.GetWorkdirFromManifestPath(stackPath)
 	if err := os.Chdir(stackWorkingDir); err != nil {
 		return nil, err
 	}
-	stackPath = GetManifestPathFromWorkdir(stackPath, stackWorkingDir)
+	stackPath = filesystem.GetManifestPathFromWorkdir(stackPath, stackWorkingDir)
 
 	s, err := ReadStack(b, isCompose)
 	if err != nil {
@@ -241,7 +271,8 @@ func GetStackFromPath(name, stackPath string, isCompose bool) (*Stack, error) {
 	}
 
 	if endpoint, ok := s.Endpoints[""]; ok {
-		s.Endpoints[s.Name] = endpoint
+		// s.Name should be sanitize and compliant with url format
+		s.Endpoints[format.ResourceK8sMetaString(s.Name)] = endpoint
 		delete(s.Endpoints, "")
 	}
 
@@ -261,42 +292,61 @@ func GetStackFromPath(name, stackPath string, isCompose bool) (*Stack, error) {
 		if uri, err := url.ParseRequestURI(svc.Build.Context); err == nil || (uri != nil && (uri.Scheme != "" || uri.Host != "")) {
 			svc.Build.Dockerfile = ""
 		} else {
-			svc.Build.Context = loadAbsPath(stackDir, svc.Build.Context)
-			svc.Build.Dockerfile = loadAbsPath(svc.Build.Context, svc.Build.Dockerfile)
+			svc.Build.Context = loadAbsPath(stackDir, svc.Build.Context, fs)
+			svc.Build.Dockerfile = loadAbsPath(svc.Build.Context, svc.Build.Dockerfile, fs)
 		}
 		copy(svc.Build.VolumesToInclude, svc.Volumes)
 	}
 	return s, nil
 }
 
+// getStackName it returns the stack name based in the following criteria
+//   - If `name` is set, that value is used as stack name. This represents the value provided by
+//     the user with `--name`
+//   - If `actualStackName` is provided, that is the value used. This represents the value provided
+//     in the okteto-stack file with the property `name`
+//   - If none of them is provided, we get the name from the repository (if any) in the folder where
+//     the stack/compose file is (`stackPath`)
+//   - If no repository is found, we get the name from the folder where the stack/compose file is (`stackPath`)
 func getStackName(name, stackPath, actualStackName string) (string, error) {
 	if name != "" {
-		if err := os.Setenv(OktetoNameEnvVar, name); err != nil {
+		if err := os.Setenv(constants.OktetoNameEnvVar, name); err != nil {
 			return "", err
 		}
 		return name, nil
 	}
 	if actualStackName == "" {
-		nameEnvVar := os.Getenv(OktetoNameEnvVar)
+		nameEnvVar := os.Getenv(constants.OktetoNameEnvVar)
 		if nameEnvVar != "" {
+			// this name could be not sanitized when running at pipeline installer
 			return nameEnvVar, nil
 		}
-		name, err := GetValidNameFromGitRepo(filepath.Dir(stackPath))
+		name, err := getValidNameFromGitRepo(filepath.Dir(stackPath))
 		if err != nil {
-			name, err = GetValidNameFromFolder(filepath.Dir(stackPath))
+			name, err = utils.GetValidNameFromFolder(filepath.Dir(stackPath))
 			if err != nil {
 				return "", err
 			}
 		}
-		if err := os.Setenv(OktetoNameEnvVar, name); err != nil {
+		if err := os.Setenv(constants.OktetoNameEnvVar, name); err != nil {
 			return "", err
 		}
 		return name, nil
 	}
-	if err := os.Setenv(OktetoNameEnvVar, actualStackName); err != nil {
+	if err := os.Setenv(constants.OktetoNameEnvVar, actualStackName); err != nil {
 		return "", err
 	}
 	return actualStackName, nil
+}
+
+// getValidNameFromGitRepo returns a name from a repository url
+func getValidNameFromGitRepo(folder string) (string, error) {
+	repo, err := utils.GetRepositoryURL(folder)
+	if err != nil {
+		return "", err
+	}
+	name := utils.TranslateURLToName(repo)
+	return name, nil
 }
 
 // ReadStack reads an okteto stack
@@ -321,8 +371,11 @@ func ReadStack(bytes []byte, isCompose bool) (*Stack, error) {
 				_, _ = sb.WriteString(fmt.Sprintf("    - %s\n", e))
 			}
 
-			_, _ = sb.WriteString("    See https://okteto.com/docs/reference/compose/ for details")
+			_, _ = sb.WriteString("    See https://okteto.com/docs/reference/docker-compose/ for details")
 			return nil, errors.New(sb.String())
+		}
+		if errors.Is(err, oktetoErrors.ErrServiceEmpty) {
+			return nil, err
 		}
 
 		msg := strings.Replace(err.Error(), "yaml: unmarshal errors:", "invalid compose manifest:", 1)
@@ -331,11 +384,8 @@ func ReadStack(bytes []byte, isCompose bool) (*Stack, error) {
 	}
 	for svcName, svc := range s.Services {
 		if svc.Build != nil {
-			if svc.Build.Name != "" {
-				svc.Build.Context = svc.Build.Name
-				svc.Build.Name = ""
-			}
-			svc.Build.setBuildDefaults()
+
+			svc.Build.SetBuildDefaults()
 		}
 		if svc.Resources.Requests.Storage.Size.Value.Cmp(resource.MustParse("0")) == 0 {
 			svc.Resources.Requests.Storage.Size.Value = resource.MustParse("1Gi")
@@ -361,8 +411,8 @@ func ReadStack(bytes []byte, isCompose bool) (*Stack, error) {
 	return s, nil
 }
 
-func (svc *Service) ignoreSyncVolumes(s *Stack) {
-	notIgnoredVolumes := make([]StackVolume, 0)
+func (svc *Service) ignoreSyncVolumes() {
+	notIgnoredVolumes := make([]build.VolumeMounts, 0)
 	wd, err := os.Getwd()
 	if err != nil {
 		oktetoLog.Info("could not get wd to ignore secrets")
@@ -375,7 +425,7 @@ func (svc *Service) ignoreSyncVolumes(s *Stack) {
 			}
 			volume.LocalPath = relPath
 		}
-		if FileExists(volume.LocalPath) {
+		if filesystem.FileExists(volume.LocalPath) {
 			notIgnoredVolumes = append(notIgnoredVolumes, volume)
 			continue
 		}
@@ -391,7 +441,7 @@ func (svc *Service) ToDev(svcName string) (*Dev, error) {
 	d := NewDev()
 	for _, p := range svc.Ports {
 		if p.HostPort != 0 {
-			d.Forward = append(d.Forward, Forward{Local: int(p.HostPort), Remote: int(p.ContainerPort)})
+			d.Forward = append(d.Forward, forward.Forward{Local: int(p.HostPort), Remote: int(p.ContainerPort)})
 		}
 	}
 	for _, v := range svc.VolumeMounts {
@@ -411,18 +461,19 @@ func (svc *Service) ToDev(svcName string) (*Dev, error) {
 }
 
 func (s *Stack) Validate() error {
-	if err := validateStackName(s.Name); err != nil {
-		return fmt.Errorf("Invalid compose name: %s", err)
+	// in case name is coming from option "name" at deploy this could not be sanitized
+	if err := validateStackName(format.ResourceK8sMetaString(s.Name)); err != nil {
+		return fmt.Errorf("invalid compose name: %w", err)
 	}
 	if len(s.Services) == 0 {
-		return fmt.Errorf("Invalid stack: 'services' cannot be empty")
+		return fmt.Errorf("invalid stack: 'services' cannot be empty")
 	}
 
 	for endpointName, endpoint := range s.Endpoints {
 		for _, endpointRule := range endpoint.Rules {
 			if service, ok := s.Services[endpointRule.Service]; ok {
 				if !IsPortInService(endpointRule.Port, service.Ports) {
-					return fmt.Errorf("Invalid endpoint '%s': service '%s' does not have port '%d'.", endpointName, endpointRule.Service, endpointRule.Port)
+					return fmt.Errorf("invalid endpoint '%s': service '%s' does not have port '%d'", endpointName, endpointRule.Service, endpointRule.Port)
 				}
 			}
 		}
@@ -434,73 +485,106 @@ func (s *Stack) Validate() error {
 	}
 	for name, svc := range s.Services {
 		if err := validateStackName(name); err != nil {
-			return fmt.Errorf("Invalid service name '%s': %s", name, err)
+			return fmt.Errorf("invalid service name '%s': %s", name, err)
 		}
 
 		if svc.Image == "" && svc.Build == nil {
-			return fmt.Errorf(fmt.Sprintf("Invalid service '%s': image cannot be empty", name))
+			return fmt.Errorf("invalid service '%s': image cannot be empty", name)
 		}
 
 		for _, v := range svc.VolumeMounts {
-			if svc.Build == nil && FileExists(v.LocalPath) {
+			if svc.Build == nil && filesystem.FileExists(v.LocalPath) {
 				continue
 			}
 			if _, err := filepath.Rel(wd, v.LocalPath); err != nil {
-				s.Warnings.VolumeMountWarnings = append(s.Warnings.VolumeMountWarnings, fmt.Sprintf("[%s]: volume '%s:%s' will be ignored. You can synchronize code to your containers using 'okteto up'. More information available here: https://okteto.com/docs/reference/cli/#up", name, v.LocalPath, v.RemotePath))
+				s.Warnings.VolumeMountWarnings = append(s.Warnings.VolumeMountWarnings, fmt.Sprintf("[%s]: volume '%s:%s' will be ignored. You can synchronize code to your containers using 'okteto up'. More information available here: https://okteto.com/docs/reference/okteto-cli/#up", name, v.LocalPath, v.RemotePath))
 			}
 			if !strings.HasPrefix(v.RemotePath, "/") {
-				return fmt.Errorf(fmt.Sprintf("Invalid volume '%s' in service '%s': must be an absolute path", v.ToString(), name))
+				return fmt.Errorf("invalid volume '%s' in service '%s': must be an absolute path", v.ToString(), name)
 			}
 		}
-		svc.ignoreSyncVolumes(s)
+		svc.ignoreSyncVolumes()
 	}
-	return validateDependsOn(s)
+	return s.Services.ValidateDependsOn(s.Services.getNames())
 }
 
+// validateStackName checks if the name is compliant
+// name param is sanitized
 func validateStackName(name string) error {
 	if name == "" {
 		return fmt.Errorf("name cannot be empty")
 	}
 	if ValidKubeNameRegex.MatchString(name) {
-		return fmt.Errorf(errBadStackName)
+		return fmt.Errorf("%s", errBadStackName)
 	}
 	if strings.HasPrefix(name, "-") || strings.HasSuffix(name, "-") {
-		return fmt.Errorf(errBadStackName)
+		return fmt.Errorf("%s", errBadStackName)
 	}
 	return nil
 }
 
-func validateDependsOn(s *Stack) error {
-	for svcName, svc := range s.Services {
+type errDependsOnItself struct {
+	service string
+}
+
+func (e *errDependsOnItself) Error() string {
+	return fmt.Sprintf("%s: Service '%s' depends cannot depend of itself.", errDependsOn.Error(), e.service)
+}
+
+func (e *errDependsOnItself) Unwrap() error {
+	return errDependsOn
+}
+
+type errDependsOnUndefined struct {
+	svc          string
+	dependentSvc string
+}
+
+func (e *errDependsOnUndefined) Error() string {
+	return fmt.Errorf("%w: Service '%s' depends on service '%s' which is undefined", errDependsOn, e.svc, e.dependentSvc).Error()
+}
+
+func (e *errDependsOnUndefined) Unwrap() error {
+	return errDependsOn
+}
+
+func (cs ComposeServices) ValidateDependsOn(svcs []string) error {
+	for _, svcName := range svcs {
+		svc, ok := cs[svcName]
+		if !ok {
+			return fmt.Errorf("service '%s' is not defined in the stack", svcName)
+		}
 		for dependentSvc, condition := range svc.DependsOn {
 			if svcName == dependentSvc {
-				return fmt.Errorf(" Service '%s' depends can not depend of itself.", svcName)
+				return &errDependsOnItself{service: svcName}
 			}
-			if _, ok := s.Services[dependentSvc]; !ok {
-				return fmt.Errorf(" Service '%s' depends on service '%s' which is undefined.", svcName, dependentSvc)
+			if _, ok := cs[dependentSvc]; !ok {
+				return &errDependsOnUndefined{svc: svcName, dependentSvc: dependentSvc}
 			}
-			if condition.Condition == DependsOnServiceCompleted && !s.Services[dependentSvc].IsJob() {
-				return fmt.Errorf(" Service '%s' is not a job. Please make sure the 'restart_policy' is not set to 'always' in service '%s' ", dependentSvc, dependentSvc)
+			if condition.Condition == DependsOnServiceCompleted && !cs[dependentSvc].IsJob() {
+				return fmt.Errorf("%w: Service '%s' is not a job. Please make sure the 'restart_policy' is not set to 'always' in service '%s' ", errDependsOn, dependentSvc, dependentSvc)
 			}
 		}
 	}
 
-	dependencyCycle := getDependentCyclic(s)
+	dependencyCycle := utils.GetDependentCyclic(cs.toGraph())
 	if len(dependencyCycle) > 0 {
 		svcsDependents := fmt.Sprintf("%s and %s", strings.Join(dependencyCycle[:len(dependencyCycle)-1], ", "), dependencyCycle[len(dependencyCycle)-1])
-		return fmt.Errorf(" There was a cyclic dependendecy between %s.", svcsDependents)
+		return fmt.Errorf("%w: There was a cyclic dependendecy between %s", errDependsOn, svcsDependents)
 	}
 	return nil
 }
 
-//GetLabelSelector returns the label selector for the stack name
+// GetLabelSelector returns the label selector for the stack name
 func (s *Stack) GetLabelSelector() string {
-	return fmt.Sprintf("%s=%s", StackNameLabel, s.Name)
+	// we need to sanitize the stack name in case this is overridden by the deploy options name
+	return fmt.Sprintf("%s=%s", StackNameLabel, format.ResourceK8sMetaString(s.Name))
 }
 
-//GetLabelSelector returns the label selector for the stack name
+// GetStackConfigMapName returns the label selector for the stack name
 func GetStackConfigMapName(stackName string) string {
-	return fmt.Sprintf("okteto-%s", stackName)
+	// we need to sanitize the stack name in case this is overridden by the deploy options name
+	return fmt.Sprintf("okteto-%s", format.ResourceK8sMetaString(stackName))
 }
 
 func IsPortInService(port int32, ports []Port) bool {
@@ -512,19 +596,19 @@ func IsPortInService(port int32, ports []Port) bool {
 	return false
 }
 
-//SetLastBuiltAnnotation sets the dev timestamp
+// SetLastBuiltAnnotation sets the dev timestamp
 func (svc *Service) SetLastBuiltAnnotation() {
 	if svc.Annotations == nil {
 		svc.Annotations = Annotations{}
 	}
-	svc.Annotations[LastBuiltAnnotation] = time.Now().UTC().Format(TimeFormat)
+	svc.Annotations[LastBuiltAnnotation] = time.Now().UTC().Format(constants.TimeFormat)
 }
 
-//isAlreadyAdded checks if a port is already on port list
-func IsAlreadyAdded(p Port, ports []Port) bool {
+// IsAlreadyAdded checks if a port is already on port list
+func IsAlreadyAdded(p PortInterface, ports []Port) bool {
 	for _, port := range ports {
-		if port.ContainerPort == p.ContainerPort {
-			oktetoLog.Infof("Port '%d:%d' is already declared on port '%d:%d'", p.HostPort, p.HostPort, port.HostPort, port.ContainerPort)
+		if port.GetContainerPort() == p.GetContainerPort() {
+			oktetoLog.Infof("Port '%d:%d' is already declared on port '%d:%d'", p.GetHostPort(), p.GetContainerPort(), port.GetHostPort(), port.GetContainerPort())
 			return true
 		}
 	}
@@ -669,6 +753,9 @@ func (stack *Stack) mergeServices(otherStack *Stack) *Stack {
 		if len(svc.Annotations) > 0 {
 			resultSvc.Annotations = svc.Annotations
 		}
+		if len(svc.NodeSelector) > 0 {
+			resultSvc.NodeSelector = svc.NodeSelector
+		}
 		if len(svc.Ports) > 0 {
 			resultSvc.Ports = svc.Ports
 		}
@@ -697,17 +784,44 @@ func (svcResources *ServiceResources) IsDefaultValue() bool {
 	return svcResources.CPU.Value.IsZero() && svcResources.Memory.Value.IsZero() && svcResources.Storage.Size.Value.IsZero() && svcResources.Storage.Class == ""
 }
 
-func isPathAComposeFile(path string) bool {
+// isFileCompose checks if the path is a compose file
+// if the env var OKTETO_SUPPORT_STACKS_ENABLED is set to true, it will return true for any file no matter the name
+// if the env var is not set, it will return true for files that start with "compose", "docker-compose" or "okteto-compose"
+func isFileCompose(path string) bool {
 	base := filepath.Base(path)
-	return strings.HasPrefix(base, "docker-compose") || strings.HasPrefix(base, "okteto-compose")
+	isComposeFileName := strings.HasPrefix(base, "compose") || strings.HasPrefix(base, "docker-compose") || strings.HasPrefix(base, "okteto-compose")
+	isStackSupported := env.LoadBooleanOrDefault(stackSupportEnabledEnvVar, defaultValueStackSupportEnabledEnvVar)
+	if !isStackSupported {
+		oktetoLog.Infof("%s is set to false. File will be treated as compose", stackSupportEnabledEnvVar)
+		return true
+	}
+
+	oktetoLog.Infof("%s is set to true. Detecting if file is compose by name", stackSupportEnabledEnvVar)
+	return isComposeFileName
+}
+
+func warnAboutComposeFileName(path string) {
+	base := filepath.Base(path)
+	isComposeFileName := strings.HasPrefix(base, "compose") || strings.HasPrefix(base, "docker-compose") || strings.HasPrefix(base, "okteto-compose")
+	isStackSupported := env.LoadBooleanOrDefault(stackSupportEnabledEnvVar, defaultValueStackSupportEnabledEnvVar)
+	if !isComposeFileName && isStackSupported {
+		stackDeprecationWarningOnce.Do(func() {
+			oktetoLog.Warning(`Okteto Stack syntax is deprecated.
+    Please consider migrating to Docker Compose syntax: https://community.okteto.com/t/important-update-migrating-from-okteto-stacks-to-docker-compose/1262`)
+		})
+	}
 }
 
 // LoadStack loads an okteto stack manifest checking "yml" and "yaml"
-func LoadStack(name string, stackPaths []string, validate bool) (*Stack, error) {
+func LoadStack(name string, stackPaths []string, validate bool, fs afero.Fs) (*Stack, error) {
 	var resultStack *Stack
 
 	if len(stackPaths) == 0 {
-		stack, err := inferStack(name)
+		dir, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		stack, err := inferStack(dir, name, fs)
 		if err != nil {
 			return nil, err
 		}
@@ -715,8 +829,8 @@ func LoadStack(name string, stackPaths []string, validate bool) (*Stack, error) 
 
 	} else {
 		for _, stackPath := range stackPaths {
-			if FileExists(stackPath) {
-				stack, err := getStack(name, stackPath)
+			if filesystem.FileExists(stackPath) {
+				stack, err := getStack(name, stackPath, fs)
 				if err != nil {
 					return nil, err
 				}
@@ -732,42 +846,35 @@ func LoadStack(name string, stackPaths []string, validate bool) (*Stack, error) 
 			return nil, err
 		}
 	}
+	for _, path := range resultStack.Paths {
+		warnAboutComposeFileName(path)
+	}
 
 	return resultStack, nil
 }
 
-func inferStack(name string) (*Stack, error) {
-	for _, possibleStackManifest := range possibleStackManifests {
-		manifestPath := filepath.Join(possibleStackManifest...)
-		if FileExists(manifestPath) {
-			stack, err := getStack(name, manifestPath)
-			if err != nil {
-				return nil, err
-			}
-
-			return stack, nil
-		}
+func inferStack(wd, name string, fs afero.Fs) (*Stack, error) {
+	composePath, err := discovery.GetComposePath(wd)
+	if err != nil {
+		return nil, err
 	}
-	return nil, oktetoErrors.UserError{
-		E:    fmt.Errorf("could not detect any compose file"),
-		Hint: "If you have a compose file, use the flag '--file' to point to your compose file",
-	}
+	return getStack(name, composePath, fs)
 }
 
-func getStack(name, manifestPath string) (*Stack, error) {
+func getStack(name, manifestPath string, fs afero.Fs) (*Stack, error) {
 	var isCompose bool
 	if isDeprecatedExtension(manifestPath) {
 		deprecatedFile := filepath.Base(manifestPath)
 		oktetoLog.Warning("The file %s will be deprecated as a default compose file name in a future version. Please consider renaming your compose file to 'okteto-stack.yml'", deprecatedFile)
 	}
-	if isPathAComposeFile(manifestPath) {
+	if isFileCompose(manifestPath) {
 		isCompose = true
 	}
-	stack, err := GetStackFromPath(name, manifestPath, isCompose)
+	stack, err := GetStackFromPath(name, manifestPath, isCompose, fs)
 	if err != nil {
 		return nil, err
 	}
-	overrideStack, err := getOverrideFile(manifestPath)
+	overrideStack, err := getOverrideFile(manifestPath, fs)
 	if err == nil {
 		oktetoLog.Info("override file detected. Merging it")
 		stack = stack.Merge(overrideStack)
@@ -785,16 +892,16 @@ func isDeprecatedExtension(stackPath string) bool {
 	return false
 }
 
-func getOverrideFile(stackPath string) (*Stack, error) {
+func getOverrideFile(stackPath string, fs afero.Fs) (*Stack, error) {
 	extension := filepath.Ext(stackPath)
 	fileName := strings.TrimSuffix(stackPath, extension)
 	overridePath := fmt.Sprintf("%s.override%s", fileName, extension)
 	var isCompose bool
-	if FileExists(stackPath) {
-		if isPathAComposeFile(stackPath) {
+	if filesystem.FileExists(overridePath) {
+		if isFileCompose(stackPath) {
 			isCompose = true
 		}
-		stack, err := GetStackFromPath("", overridePath, isCompose)
+		stack, err := GetStackFromPath("", overridePath, isCompose, fs)
 		if err != nil {
 			return nil, err
 		}
@@ -823,7 +930,7 @@ func loadEnvFiles(svc *Service, svcName string) error {
 
 func setEnvironmentFromFile(svc *Service, filename string) error {
 	var err error
-	filename, err = ExpandEnv(filename, true)
+	filename, err = env.ExpandEnv(filename)
 	if err != nil {
 		return err
 	}
@@ -832,11 +939,15 @@ func setEnvironmentFromFile(svc *Service, filename string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			oktetoLog.Debugf("Error closing file %s: %s", filename, err)
+		}
+	}()
 
 	envMap, err := godotenv.ParseWithLookup(f, os.LookupEnv)
 	if err != nil {
-		return fmt.Errorf("error parsing env_file %s: %s", filename, err.Error())
+		return fmt.Errorf("error parsing env_file %s: %w", filename, err)
 	}
 
 	for _, e := range svc.Environment {
@@ -849,9 +960,31 @@ func setEnvironmentFromFile(svc *Service, filename string) error {
 		}
 		svc.Environment = append(
 			svc.Environment,
-			EnvVar{Name: name, Value: value},
+			env.Var{Name: name, Value: value},
 		)
 	}
 
 	return nil
+}
+
+func (s ComposeServices) toGraph() utils.Graph {
+	g := utils.Graph{}
+	for svcName, svcInfo := range s {
+		dependsOnList := []string{}
+		for dependantSvc := range svcInfo.DependsOn {
+			dependsOnList = append(dependsOnList, dependantSvc)
+		}
+		g[svcName] = dependsOnList
+	}
+	return g
+}
+
+func (stack *Stack) GetServicesWithBuildSection() map[string]bool {
+	result := make(map[string]bool)
+	for name, service := range stack.Services {
+		if service.Build != nil || len(service.VolumeMounts) != 0 {
+			result[name] = true
+		}
+	}
+	return result
 }

@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,155 +15,189 @@ package okteto
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/okteto/okteto/pkg/config"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/types"
 	"github.com/shurcooL/graphql"
-	giturls "github.com/whilp/git-urls"
 )
 
-// DeployPipeline creates a pipeline
-func (c *OktetoClient) DeployPipeline(ctx context.Context, name, repository, branch, filename string, variables []types.Variable) (*types.GitDeployResponse, error) {
-	origin := config.GetDeployOrigin()
+var (
+	ErrDeployPipelineLabelsFeatureNotSupported = oktetoErrors.UserError{
+		E: errors.New(`deploying a preview environments with labels requires a more recent version of Okteto.
 
-	gitDeployResponse := &types.GitDeployResponse{}
+		Consider removing the "--label" flag, or please upgrade to the latest version`),
+		Hint: "For more information and upgrade instructions, please visit our docs at https://www.okteto.com/docs or contact your system administrator.",
+	}
+)
 
-	if len(variables) > 0 {
-		var mutation struct {
-			GitDeployResponse struct {
-				Action struct {
-					Id     graphql.String
-					Name   graphql.String
-					Status graphql.String
-				}
-				GitDeploy struct {
-					Id         graphql.String
-					Name       graphql.String
-					Status     graphql.String
-					Repository graphql.String
-				}
-			} `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename)"`
-		}
+type pipelineClient struct {
+	client        graphqlClientInterface
+	provideTicker func(time.Duration) *time.Ticker
+	provideTimer  func(time.Duration) *time.Timer
+	url           string
+}
 
-		variablesArg := []InputVariable{}
-		for _, v := range variables {
-			variablesArg = append(variablesArg, InputVariable{
-				Name:  graphql.String(v.Name),
-				Value: graphql.String(v.Value),
-			})
-		}
-		// if OKTETO_ORIGIN was provided don't override it
-		injectOrigin := true
-		for _, v := range variablesArg {
-			if v.Name == "OKTETO_ORIGIN" {
-				injectOrigin = false
-			}
-		}
-		if injectOrigin {
-			variablesArg = append(variablesArg, InputVariable{
-				Name:  graphql.String("OKTETO_ORIGIN"),
-				Value: graphql.String(origin),
-			})
-		}
-		queryVariables := map[string]interface{}{
-			"name":       graphql.String(name),
-			"repository": graphql.String(repository),
-			"space":      graphql.String(Context().Namespace),
-			"branch":     graphql.String(branch),
-			"variables":  variablesArg,
-			"filename":   graphql.String(filename),
-		}
+func newPipelineClient(client graphqlClientInterface, url string) *pipelineClient {
+	return &pipelineClient{
+		client:        client,
+		url:           url,
+		provideTicker: time.NewTicker,
+		provideTimer:  time.NewTimer,
+	}
+}
 
-		err := mutate(ctx, &mutation, queryVariables, c.client)
+type deployPipelineMutation struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename)"`
+}
+
+type deployPipelineMutationWithLabels struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, labels: $labels)"`
+}
+
+type getPipelineByNameQuery struct {
+	Response getPipelineByNameResponse `graphql:"space(id: $id)"`
+}
+
+type destroyPipelineWithVolumesMutation struct {
+	Response destroyPipelineResponse `graphql:"destroyGitRepository(name: $name, space: $space, destroyVolumes: $destroyVolumes)"`
+}
+
+type destroyPipelineWithoutVolumesMutation struct {
+	Response destroyPipelineResponse `graphql:"destroyGitRepository(name: $name, space: $space)"`
+}
+
+type getPipelineResources struct {
+	Response previewResourcesStatus `graphql:"space(id: $id)"`
+}
+
+type deployPipelineResponse struct {
+	Action    actionStruct
+	GitDeploy gitDeployInfoWithRepoInfo
+}
+
+type gitDeployInfoWithRepoInfo struct {
+	Id         graphql.String
+	Name       graphql.String
+	Status     graphql.String
+	Repository graphql.String
+}
+
+type getPipelineByNameResponse struct {
+	GitDeploys []gitDeployInfoIdNameStatus
+}
+
+type gitDeployInfoIdNameStatus struct {
+	Id     graphql.String
+	Name   graphql.String
+	Status graphql.String
+}
+
+type destroyPipelineResponse struct {
+	Action    actionStruct
+	GitDeploy gitDeployInfoWithRepoInfo
+}
+
+// Deploy creates a pipeline
+func (c *pipelineClient) Deploy(ctx context.Context, opts types.PipelineDeployOptions) (*types.GitDeployResponse, error) {
+	oktetoLog.Infof("deploying pipeline '%s' mutation on %s", opts.Name, opts.Namespace)
+
+	mutationVariables := c.getDeployVariables(opts)
+	var response deployPipelineResponse
+	if len(opts.Labels) == 0 {
+		mutationStruct := &deployPipelineMutation{}
+		err := mutate(ctx, mutationStruct, mutationVariables, c.client)
 		if err != nil {
 			return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
 		}
-
-		gitDeployResponse.Action = &types.Action{
-			ID:     string(mutation.GitDeployResponse.Action.Id),
-			Name:   string(mutation.GitDeployResponse.Action.Name),
-			Status: string(mutation.GitDeployResponse.Action.Status),
-		}
-		gitDeployResponse.GitDeploy = &types.GitDeploy{
-			ID:         string(mutation.GitDeployResponse.GitDeploy.Id),
-			Name:       string(mutation.GitDeployResponse.GitDeploy.Name),
-			Repository: string(mutation.GitDeployResponse.GitDeploy.Repository),
-			Status:     string(mutation.GitDeployResponse.GitDeploy.Status),
-		}
-
+		response = mutationStruct.Response
 	} else {
-		var mutation struct {
-			GitDeployResponse struct {
-				Action struct {
-					Id     graphql.String
-					Name   graphql.String
-					Status graphql.String
-				}
-				GitDeploy struct {
-					Id         graphql.String
-					Name       graphql.String
-					Status     graphql.String
-					Repository graphql.String
-				}
-			} `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, filename: $filename, variables: $variables)"`
-		}
+		mutationStruct := &deployPipelineMutationWithLabels{}
+		err := mutate(ctx, mutationStruct, mutationVariables, c.client)
 
-		queryVariables := map[string]interface{}{
-			"name":       graphql.String(name),
-			"repository": graphql.String(repository),
-			"space":      graphql.String(Context().Namespace),
-			"branch":     graphql.String(branch),
-			"filename":   graphql.String(filename),
-			"variables": []InputVariable{
-				{Name: graphql.String("OKTETO_ORIGIN"), Value: graphql.String(origin)},
-			},
-		}
-
-		err := mutate(ctx, &mutation, queryVariables, c.client)
 		if err != nil {
+			if strings.Contains(err.Error(), "Unknown argument \"labels\" on field \"deployGitRepository\" of type \"Mutation\"") {
+				return nil, oktetoErrors.UserError{E: ErrDeployPipelineLabelsFeatureNotSupported, Hint: "Please upgrade to the latest version or ask your administrator"}
+			}
 			return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
 		}
+		response = mutationStruct.Response
+	}
 
-		gitDeployResponse.Action = &types.Action{
-			ID:     string(mutation.GitDeployResponse.Action.Id),
-			Name:   string(mutation.GitDeployResponse.Action.Name),
-			Status: string(mutation.GitDeployResponse.Action.Status),
-		}
-		gitDeployResponse.GitDeploy = &types.GitDeploy{
-			ID:         string(mutation.GitDeployResponse.GitDeploy.Id),
-			Name:       string(mutation.GitDeployResponse.GitDeploy.Name),
-			Repository: string(mutation.GitDeployResponse.GitDeploy.Repository),
-			Status:     string(mutation.GitDeployResponse.GitDeploy.Status),
-		}
-
+	gitDeployResponse := &types.GitDeployResponse{
+		Action: &types.Action{
+			ID:     string(response.Action.Id),
+			Name:   string(response.Action.Name),
+			Status: string(response.Action.Status),
+		},
+		GitDeploy: &types.GitDeploy{
+			ID:         string(response.GitDeploy.Id),
+			Name:       string(response.GitDeploy.Name),
+			Repository: string(response.GitDeploy.Repository),
+			Status:     string(response.GitDeploy.Status),
+		},
 	}
 	return gitDeployResponse, nil
 }
 
-// GetPipelineByName gets a pipeline given its name
-func (c *OktetoClient) GetPipelineByName(ctx context.Context, name string) (*types.GitDeploy, error) {
-	var queryStruct struct {
-		Space struct {
-			GitDeploys []struct {
-				Id     graphql.String
-				Name   graphql.String
-				Status graphql.String
-			}
-		} `graphql:"space(id: $id)"`
+func (c *pipelineClient) getDeployVariables(opts types.PipelineDeployOptions) map[string]interface{} {
+	variablesVariable := make([]InputVariable, 0)
+	for _, v := range opts.Variables {
+		variablesVariable = append(variablesVariable, InputVariable{
+			Name:  graphql.String(v.Name),
+			Value: graphql.String(v.Value),
+		})
 	}
+	injectOrigin := true
+	for _, v := range variablesVariable {
+		if v.Name == "OKTETO_ORIGIN" {
+			injectOrigin = false
+		}
+	}
+	if injectOrigin {
+		origin := config.GetDeployOrigin()
+		variablesVariable = append(variablesVariable, InputVariable{
+			Name:  graphql.String("OKTETO_ORIGIN"),
+			Value: graphql.String(origin),
+		})
+	}
+	vars := map[string]interface{}{
+		"name":       graphql.String(opts.Name),
+		"space":      graphql.String(opts.Namespace),
+		"repository": graphql.String(opts.Repository),
+		"branch":     graphql.String(opts.Branch),
+		"variables":  variablesVariable,
+		"filename":   graphql.String(opts.Filename),
+	}
+
+	if len(opts.Labels) > 0 {
+		labelsVariable := make(labelList, 0)
+		for _, l := range opts.Labels {
+			labelsVariable = append(labelsVariable, graphql.String(l))
+		}
+		vars["labels"] = labelsVariable
+	}
+	return vars
+}
+
+// GetByName gets a pipeline given its name
+func (c *pipelineClient) GetByName(ctx context.Context, name, namespace string) (*types.GitDeploy, error) {
+	oktetoLog.Infof("getting pipeline '%s' in namespace '%s'", name, namespace)
+	var queryStruct getPipelineByNameQuery
 	variables := map[string]interface{}{
-		"id": graphql.String(Context().Namespace),
+		"id": graphql.String(namespace),
 	}
 	err := query(ctx, &queryStruct, variables, c.client)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get pipeline: %w", err)
 	}
 
-	for _, gitDeploy := range queryStruct.Space.GitDeploys {
+	for _, gitDeploy := range queryStruct.Response.GitDeploys {
 		if string(gitDeploy.Name) == name {
 			return &types.GitDeploy{
 				ID:     string(gitDeploy.Id),
@@ -175,144 +209,53 @@ func (c *OktetoClient) GetPipelineByName(ctx context.Context, name string) (*typ
 	return nil, oktetoErrors.ErrNotFound
 }
 
-// GetPipelineByRepository gets a pipeline given its repo url
-func (c *OktetoClient) GetPipelineByRepository(ctx context.Context, repository string) (*types.GitDeployResponse, error) {
-	var queryStruct struct {
-		Pipeline struct {
-			GitDeploys []struct {
-				Id         graphql.String
-				Repository graphql.String
-				Status     graphql.String
-			}
-		} `graphql:"space(id: $id)"`
-	}
-	variables := map[string]interface{}{
-		"id": graphql.String(Context().Namespace),
-	}
-	err := query(ctx, &queryStruct, variables, c.client)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, gitDeploy := range queryStruct.Pipeline.GitDeploys {
-		if AreSameRepository(string(gitDeploy.Repository), repository) {
-			pipeline := &types.GitDeployResponse{
-				GitDeploy: &types.GitDeploy{
-					ID:         string(gitDeploy.Id),
-					Repository: string(gitDeploy.Repository),
-					Status:     string(gitDeploy.Status),
-				},
-			}
-			return pipeline, nil
-		}
-	}
-	return nil, oktetoErrors.ErrNotFound
-}
-
-func AreSameRepository(repoA, repoB string) bool {
-	parsedRepoA, err := giturls.Parse(repoA)
-	if err != nil {
-		return false
-	}
-	parsedRepoB, err := giturls.Parse(repoB)
-	if err != nil {
-		return false
-	}
-
-	if parsedRepoA.Hostname() != parsedRepoB.Hostname() {
-		return false
-	}
-
-	//In short SSH URLs like git@github.com:okteto/movies.git, path doesn't start with '/', so we need to remove it
-	//in case it exists. It also happens with '.git' suffix. You don't have to specify it, so we remove in both cases
-	repoPathA := strings.TrimSuffix(strings.TrimPrefix(parsedRepoA.Path, "/"), ".git")
-	repoPathB := strings.TrimSuffix(strings.TrimPrefix(parsedRepoB.Path, "/"), ".git")
-
-	return repoPathA == repoPathB
-}
-
-// DestroyPipeline destroys a pipeline
-func (c *OktetoClient) DestroyPipeline(ctx context.Context, name string, destroyVolumes bool) (*types.GitDeployResponse, error) {
-	oktetoLog.Infof("destroy pipeline: %s/%s", Context().Namespace, name)
+// Destroy destroys a pipeline
+func (c *pipelineClient) Destroy(ctx context.Context, name, namespace string, destroyVolumes bool) (*types.GitDeployResponse, error) {
+	oktetoLog.Infof("destroy pipeline: %s/%s", namespace, name)
 	gitDeployResponse := &types.GitDeployResponse{}
 	if destroyVolumes {
-		var mutation struct {
-			GitDeployResponse struct {
-				Action struct {
-					Id     graphql.String
-					Name   graphql.String
-					Status graphql.String
-				}
-				GitDeploy struct {
-					Id         graphql.String
-					Name       graphql.String
-					Status     graphql.String
-					Repository graphql.String
-				}
-			} `graphql:"destroyGitRepository(name: $name, space: $space, destroyVolumes: $destroyVolumes)"`
-		}
+		var mutation destroyPipelineWithVolumesMutation
 
 		queryVariables := map[string]interface{}{
 			"name":           graphql.String(name),
 			"destroyVolumes": graphql.Boolean(destroyVolumes),
-			"space":          graphql.String(Context().Namespace),
+			"space":          graphql.String(namespace),
 		}
 		err := mutate(ctx, &mutation, queryVariables, c.client)
 		if err != nil {
-			if strings.Contains(err.Error(), "Cannot query field \"action\" on type \"GitDeploy\"") {
-				return c.deprecatedDestroyPipeline(ctx, name, destroyVolumes)
-			}
 			return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
 		}
 		gitDeployResponse.Action = &types.Action{
-			ID:     string(mutation.GitDeployResponse.Action.Id),
-			Name:   string(mutation.GitDeployResponse.Action.Name),
-			Status: string(mutation.GitDeployResponse.Action.Status),
+			ID:     string(mutation.Response.Action.Id),
+			Name:   string(mutation.Response.Action.Name),
+			Status: string(mutation.Response.Action.Status),
 		}
 		gitDeployResponse.GitDeploy = &types.GitDeploy{
-			ID:         string(mutation.GitDeployResponse.GitDeploy.Id),
-			Name:       string(mutation.GitDeployResponse.GitDeploy.Name),
-			Repository: string(mutation.GitDeployResponse.GitDeploy.Repository),
-			Status:     string(mutation.GitDeployResponse.GitDeploy.Status),
+			ID:         string(mutation.Response.GitDeploy.Id),
+			Name:       string(mutation.Response.GitDeploy.Name),
+			Repository: string(mutation.Response.GitDeploy.Repository),
+			Status:     string(mutation.Response.GitDeploy.Status),
 		}
 	} else {
-		var mutation struct {
-			GitDeployResponse struct {
-				Action struct {
-					Id     graphql.String
-					Name   graphql.String
-					Status graphql.String
-				}
-				GitDeploy struct {
-					Id         graphql.String
-					Name       graphql.String
-					Status     graphql.String
-					Repository graphql.String
-				}
-			} `graphql:"destroyGitRepository(name: $name, space: $space)"`
-		}
-
+		var mutation destroyPipelineWithoutVolumesMutation
 		queryVariables := map[string]interface{}{
 			"name":  graphql.String(name),
-			"space": graphql.String(Context().Namespace),
+			"space": graphql.String(GetContext().Namespace),
 		}
 		err := mutate(ctx, &mutation, queryVariables, c.client)
 		if err != nil {
-			if strings.Contains(err.Error(), "Cannot query field \"action\" on type \"GitDeploy\"") {
-				return c.deprecatedDestroyPipeline(ctx, name, destroyVolumes)
-			}
 			return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
 		}
 		gitDeployResponse.Action = &types.Action{
-			ID:     string(mutation.GitDeployResponse.Action.Id),
-			Name:   string(mutation.GitDeployResponse.Action.Name),
-			Status: string(mutation.GitDeployResponse.Action.Status),
+			ID:     string(mutation.Response.Action.Id),
+			Name:   string(mutation.Response.Action.Name),
+			Status: string(mutation.Response.Action.Status),
 		}
 		gitDeployResponse.GitDeploy = &types.GitDeploy{
-			ID:         string(mutation.GitDeployResponse.GitDeploy.Id),
-			Name:       string(mutation.GitDeployResponse.GitDeploy.Name),
-			Repository: string(mutation.GitDeployResponse.GitDeploy.Repository),
-			Status:     string(mutation.GitDeployResponse.GitDeploy.Status),
+			ID:         string(mutation.Response.GitDeploy.Id),
+			Name:       string(mutation.Response.GitDeploy.Name),
+			Repository: string(mutation.Response.GitDeploy.Repository),
+			Status:     string(mutation.Response.GitDeploy.Status),
 		}
 	}
 
@@ -320,103 +263,54 @@ func (c *OktetoClient) DestroyPipeline(ctx context.Context, name string, destroy
 	return gitDeployResponse, nil
 }
 
-func (c *OktetoClient) deprecatedDestroyPipeline(ctx context.Context, name string, destroyVolumes bool) (*types.GitDeployResponse, error) {
-	oktetoLog.Infof("destroy pipeline: %s/%s", Context().Namespace, name)
-	gitDeployResponse := &types.GitDeployResponse{}
-	if destroyVolumes {
-		var mutation struct {
-			GitDeployResponse struct {
-				Id     graphql.String
-				Status graphql.String
-			} `graphql:"destroyGitRepository(name: $name, space: $space, destroyVolumes: $destroyVolumes)"`
-		}
-
-		queryVariables := map[string]interface{}{
-			"name":           graphql.String(name),
-			"destroyVolumes": graphql.Boolean(destroyVolumes),
-			"space":          graphql.String(Context().Namespace),
-		}
-		err := mutate(ctx, &mutation, queryVariables, c.client)
-		if err != nil {
-			return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
-		}
-		gitDeployResponse.GitDeploy = &types.GitDeploy{
-			ID:     string(mutation.GitDeployResponse.Id),
-			Status: string(mutation.GitDeployResponse.Status),
-		}
-	} else {
-		var mutation struct {
-			GitDeployResponse struct {
-				Id     graphql.String
-				Status graphql.String
-			} `graphql:"destroyGitRepository(name: $name, space: $space)"`
-		}
-
-		queryVariables := map[string]interface{}{
-			"name":  graphql.String(name),
-			"space": graphql.String(Context().Namespace),
-		}
-		err := mutate(ctx, &mutation, queryVariables, c.client)
-		if err != nil {
-			if strings.Contains(err.Error(), "Cannot query field \"action\" on type \"GitDeploy\"") {
-				return c.deprecatedDestroyPipeline(ctx, name, destroyVolumes)
-			}
-			return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
-		}
-		gitDeployResponse.GitDeploy = &types.GitDeploy{
-			ID:     string(mutation.GitDeployResponse.Id),
-			Status: string(mutation.GitDeployResponse.Status),
-		}
-	}
-
-	oktetoLog.Infof("destroy pipeline: %+v", gitDeployResponse.GitDeploy.Status)
-	return gitDeployResponse, nil
-}
-
-func (c *OktetoClient) GetResourcesStatusFromPipeline(ctx context.Context, name string) (map[string]string, error) {
-	var queryStruct struct {
-		Space struct {
-			Deployments []struct {
-				ID         graphql.String
-				Status     graphql.String
-				DeployedBy graphql.String
-			}
-			Statefulsets []struct {
-				ID         graphql.String
-				Status     graphql.String
-				DeployedBy graphql.String
-			}
-			Jobs []struct {
-				ID         graphql.String
-				Status     graphql.String
-				DeployedBy graphql.String
-			}
-		} `graphql:"space(id: $id)"`
-	}
+// GetResourcesStatus returns the status of deployments statefulsets and jobs
+func (c *pipelineClient) GetResourcesStatus(ctx context.Context, name, namespace string) (map[string]string, error) {
+	oktetoLog.Infof("get resource status started for pipeline: %s/%s", namespace, name)
+	var queryStruct getPipelineResources
 	variables := map[string]interface{}{
-		"id": graphql.String(Context().Namespace),
+		"id": graphql.String(namespace),
 	}
 
 	if err := query(ctx, &queryStruct, variables, c.client); err != nil {
-		return nil, err
+		if oktetoErrors.IsNotFound(err) {
+			okClient, err := NewOktetoClientFromUrlAndToken(c.url, GetContext().Token)
+			if err != nil {
+				return nil, err
+			}
+			return okClient.Previews().GetResourcesStatus(ctx, namespace, name)
+		}
+		return nil, fmt.Errorf("failed to get resources status: %w", err)
 	}
 
 	status := make(map[string]string)
-	for _, d := range queryStruct.Space.Deployments {
+	for _, d := range queryStruct.Response.Deployments {
 		if string(d.DeployedBy) == name {
-			status[string(d.ID)] = string(d.Status)
+			resourceName := getResourceFullName(Deployment, string(d.Name))
+			status[resourceName] = string(d.Status)
 
 		}
 	}
-	for _, sfs := range queryStruct.Space.Statefulsets {
+	for _, sfs := range queryStruct.Response.Statefulsets {
 		if string(sfs.DeployedBy) == name {
-			status[string(sfs.ID)] = string(sfs.Status)
+			resourceName := getResourceFullName(StatefulSet, string(sfs.Name))
+			status[resourceName] = string(sfs.Status)
 		}
 	}
-	for _, j := range queryStruct.Space.Jobs {
+	for _, j := range queryStruct.Response.Jobs {
 		if string(j.DeployedBy) == name {
-			status[string(j.ID)] = string(j.Status)
+			resourceName := getResourceFullName(Job, string(j.Name))
+			status[resourceName] = string(j.Status)
+		}
+	}
+	for _, cj := range queryStruct.Response.Cronjobs {
+		if string(cj.DeployedBy) == name {
+			resourceName := getResourceFullName(CronJob, string(cj.Name))
+			status[resourceName] = string(cj.Status)
 		}
 	}
 	return status, nil
+}
+
+func getResourceFullName(kind, name string) string {
+	return strings.ToLower(fmt.Sprintf("%s/%s", kind, name))
 }

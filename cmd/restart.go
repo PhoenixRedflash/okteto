@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,6 +15,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -25,31 +26,41 @@ import (
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/k8s/pods"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	"github.com/okteto/okteto/pkg/okteto"
-
 	"github.com/okteto/okteto/pkg/model"
-
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/validator"
+	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
 
 // Restart restarts the pods of a given dev mode deployment
-func Restart() *cobra.Command {
+func Restart(fs afero.Fs) *cobra.Command {
 	var namespace string
 	var k8sContext string
 	var devPath string
 
 	cmd := &cobra.Command{
-		Use:    "restart [svc]",
-		Short:  "Restart the deployments listed in the services field of a development container",
-		Args:   utils.MaximumNArgsAccepted(1, "https://okteto.com/docs/reference/cli/#restart"),
+		Use:    "restart [devContainer]",
+		Short:  "Restarts the containers corresponding to the 'services' section for a given Development Container",
+		Args:   utils.MaximumNArgsAccepted(1, "https://okteto.com/docs/reference/okteto-cli/#restart"),
 		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validator.FileArgumentIsNotDir(fs, devPath); err != nil {
+				return err
+			}
+
 			ctx := context.Background()
 
-			manifestOpts := contextCMD.ManifestOptions{Filename: devPath, Namespace: namespace, K8sContext: k8sContext}
-			manifest, err := contextCMD.LoadManifestWithContext(ctx, manifestOpts)
+			manifestOpts := contextCMD.ManifestOptions{Filename: devPath}
+			manifest, err := model.GetManifestV2(manifestOpts.Filename, afero.NewOsFs())
 			if err != nil {
 				return err
+			}
+
+			if !okteto.IsOkteto() {
+				if err := manifest.ValidateForCLIOnly(); err != nil {
+					return err
+				}
 			}
 
 			devName := ""
@@ -58,7 +69,14 @@ func Restart() *cobra.Command {
 			}
 			dev, err := utils.GetDevFromManifest(manifest, devName)
 			if err != nil {
-				return err
+				if !errors.Is(err, utils.ErrNoDevSelected) {
+					return err
+				}
+				selector := utils.NewOktetoSelector("Select which development container to restart:", "Development container")
+				dev, err = utils.SelectDevFromManifest(manifest, selector, manifest.Dev.GetDevs())
+				if err != nil {
+					return err
+				}
 			}
 
 			if len(dev.Services) == 0 {
@@ -69,9 +87,9 @@ func Restart() *cobra.Command {
 			if len(args) > 0 {
 				serviceName = args[0]
 			}
-			err = executeRestart(ctx, dev, serviceName)
+			err = executeRestart(ctx, dev, serviceName, namespace)
 			if err != nil {
-				return fmt.Errorf("failed to restart your deployments: %s", err)
+				return fmt.Errorf("failed to restart your deployments: %w", err)
 			}
 			analytics.TrackRestart(err == nil)
 
@@ -81,35 +99,36 @@ func Restart() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVarP(&devPath, "file", "f", utils.DefaultManifest, "path to the manifest file")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "namespace where the restart command is executed")
-	cmd.Flags().StringVarP(&k8sContext, "context", "c", "", "context where the restart command is executed")
+	cmd.Flags().StringVarP(&devPath, "file", "f", "", "the path to the Okteto Manifest")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "overwrite the current Okteto Namespace")
+	cmd.Flags().StringVarP(&k8sContext, "context", "c", "", "overwrite the current Okteto Context")
 
 	return cmd
 }
 
-func executeRestart(ctx context.Context, dev *model.Dev, sn string) error {
+func executeRestart(ctx context.Context, dev *model.Dev, serviceName, namespace string) error {
 	oktetoLog.Infof("restarting services")
 	client, _, err := okteto.GetK8sClient()
 	if err != nil {
 		return err
 	}
 
-	spinner := utils.NewSpinner("Restarting deployments...")
-	spinner.Start()
-	defer spinner.Stop()
+	oktetoLog.Spinner("Restarting deployments...")
+	oktetoLog.StartSpinner()
+	defer oktetoLog.StopSpinner()
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 	exit := make(chan error, 1)
 
 	go func() {
-		exit <- pods.Restart(ctx, dev, client, sn)
+		exit <- pods.Restart(ctx, dev, namespace, client, serviceName)
 	}()
 
 	select {
 	case <-stop:
 		oktetoLog.Infof("CTRL+C received, starting shutdown sequence")
-		spinner.Stop()
+		oktetoLog.StopSpinner()
 		return oktetoErrors.ErrIntSig
 	case err := <-exit:
 		if err != nil {

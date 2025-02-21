@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,20 +19,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/okteto/okteto/pkg/constants"
 	"github.com/okteto/okteto/pkg/model"
 )
 
 func Test_addOnEmpty(t *testing.T) {
-	dir, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir := t.TempDir()
 
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatal(err)
 	}
-
-	defer os.RemoveAll(dir)
 
 	sshConfig := filepath.Join(dir, "config")
 
@@ -55,12 +51,7 @@ func Test_addOnEmpty(t *testing.T) {
 	}
 }
 func Test_add(t *testing.T) {
-	dir, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 	sshConfig := filepath.Join(dir, "config")
 
 	if err := add(sshConfig, "test.okteto", model.Localhost, 8080); err != nil {
@@ -121,9 +112,9 @@ func Test_removeHost(t *testing.T) {
 					{
 						hostnames: []string{"test.okteto"},
 						params: []*param{
-							newParam(hostNameKeyword, []string{model.Localhost}, nil),
-							newParam(portKeyword, []string{"8080"}, nil),
-							newParam(strictHostKeyCheckingKeyword, []string{"no"}, nil),
+							newParam(hostNameKeyword, []string{model.Localhost}),
+							newParam(portKeyword, []string{"8080"}),
+							newParam(strictHostKeyCheckingKeyword, []string{"no"}),
 						},
 					},
 				},
@@ -138,9 +129,9 @@ func Test_removeHost(t *testing.T) {
 					{
 						hostnames: []string{"test.okteto"},
 						params: []*param{
-							newParam(hostNameKeyword, []string{model.Localhost}, nil),
-							newParam(portKeyword, []string{"8080"}, nil),
-							newParam(strictHostKeyCheckingKeyword, []string{"no"}, nil),
+							newParam(hostNameKeyword, []string{model.Localhost}),
+							newParam(portKeyword, []string{"8080"}),
+							newParam(strictHostKeyCheckingKeyword, []string{"no"}),
 						},
 					},
 				},
@@ -155,25 +146,25 @@ func Test_removeHost(t *testing.T) {
 					{
 						hostnames: []string{"test.okteto"},
 						params: []*param{
-							newParam(hostNameKeyword, []string{model.Localhost}, nil),
-							newParam(portKeyword, []string{"8080"}, nil),
-							newParam(strictHostKeyCheckingKeyword, []string{"no"}, nil),
+							newParam(hostNameKeyword, []string{model.Localhost}),
+							newParam(portKeyword, []string{"8080"}),
+							newParam(strictHostKeyCheckingKeyword, []string{"no"}),
 						},
 					},
 					{
 						hostnames: []string{"test2.okteto"},
 						params: []*param{
-							newParam(hostNameKeyword, []string{model.Localhost}, nil),
-							newParam(portKeyword, []string{"8080"}, nil),
-							newParam(strictHostKeyCheckingKeyword, []string{"no"}, nil),
+							newParam(hostNameKeyword, []string{model.Localhost}),
+							newParam(portKeyword, []string{"8080"}),
+							newParam(strictHostKeyCheckingKeyword, []string{"no"}),
 						},
 					},
 					{
 						hostnames: []string{"test3.okteto"},
 						params: []*param{
-							newParam(hostNameKeyword, []string{model.Localhost}, nil),
-							newParam(portKeyword, []string{"8080"}, nil),
-							newParam(strictHostKeyCheckingKeyword, []string{"no"}, nil),
+							newParam(hostNameKeyword, []string{model.Localhost}),
+							newParam(portKeyword, []string{"8080"}),
+							newParam(strictHostKeyCheckingKeyword, []string{"no"}),
 						},
 					},
 				},
@@ -188,25 +179,25 @@ func Test_removeHost(t *testing.T) {
 					{
 						hostnames: []string{"test.okteto"},
 						params: []*param{
-							newParam(hostNameKeyword, []string{model.Localhost}, nil),
-							newParam(portKeyword, []string{"8080"}, nil),
-							newParam(strictHostKeyCheckingKeyword, []string{"no"}, nil),
+							newParam(hostNameKeyword, []string{model.Localhost}),
+							newParam(portKeyword, []string{"8080"}),
+							newParam(strictHostKeyCheckingKeyword, []string{"no"}),
 						},
 					},
 					{
 						hostnames: []string{"test2.okteto"},
 						params: []*param{
-							newParam(hostNameKeyword, []string{model.Localhost}, nil),
-							newParam(portKeyword, []string{"8080"}, nil),
-							newParam(strictHostKeyCheckingKeyword, []string{"no"}, nil),
+							newParam(hostNameKeyword, []string{model.Localhost}),
+							newParam(portKeyword, []string{"8080"}),
+							newParam(strictHostKeyCheckingKeyword, []string{"no"}),
 						},
 					},
 					{
 						hostnames: []string{"test3.okteto"},
 						params: []*param{
-							newParam(hostNameKeyword, []string{model.Localhost}, nil),
-							newParam(portKeyword, []string{"8080"}, nil),
-							newParam(strictHostKeyCheckingKeyword, []string{"no"}, nil),
+							newParam(hostNameKeyword, []string{model.Localhost}),
+							newParam(portKeyword, []string{"8080"}),
+							newParam(strictHostKeyCheckingKeyword, []string{"no"}),
 						},
 					},
 				},
@@ -225,18 +216,11 @@ func Test_removeHost(t *testing.T) {
 }
 
 func TestGetPort(t *testing.T) {
-	dir, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir := t.TempDir()
 
-	defer os.RemoveAll(dir)
+	t.Setenv(constants.OktetoHomeEnvVar, dir)
 
-	if err := os.Setenv(model.OktetoHomeEnvVar, dir); err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.Unsetenv(model.OktetoHomeEnvVar)
+	defer os.Unsetenv(constants.OktetoHomeEnvVar)
 
 	if _, err := GetPort(t.Name()); err == nil {
 		t.Fatal("expected error on non existing host")

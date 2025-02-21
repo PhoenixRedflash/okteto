@@ -102,6 +102,8 @@
         # If the channel is unknown the release will fail
         CHANNELS=
 
+        is_oficial_release=false
+
         # dev releases don't have tags
         if [ "$RELEASE_TAG" = "" ]; then
                 CHANNELS=("dev")
@@ -112,7 +114,7 @@
                 # Stable releases are added to all channel
                 if [ -z "$prerel" ]; then
                         CHANNELS=("stable" "beta" "dev")
-
+                        is_oficial_release=true
                 elif [[ $prerel =~ $beta_prerel_regex ]]; then
                         CHANNELS=("beta" "dev")
 
@@ -126,6 +128,8 @@
                 fi
         fi
 
+        BIN_BUCKET_ROOT="downloads.okteto.com/cli"
+
         for chan in "${CHANNELS[@]}"; do
                 echo "---------------------------------------------------------------------------------"
                 tag="${RELEASE_TAG:-"$PSEUDO_TAG"}"
@@ -138,13 +142,14 @@
                 # BIN_BUCKET_NAME is the name of the bucket where the binaries are stored.
                 # Starting at Okteto CLI 2.0, all these binaries are publicly accessible at:
                 # https://downloads.okteto.com/cli/<channel>/<tag>
-                BIN_BUCKET_ROOT="downloads.okteto.com/cli/${chan}"
-                BIN_BUCKET_NAME="${BIN_BUCKET_ROOT}/${tag}"
 
-                # VERSIONS_BUCKET_NAME are all the available versions for a release channel.
+                BIN_BUCKET_ROOT_WITH_CHAN="${BIN_BUCKET_ROOT}/${chan}"
+                BIN_BUCKET_NAME="${BIN_BUCKET_ROOT_WITH_CHAN}/${tag}"
+
+                # VERSIONS_BUCKET_FILENAME are all the available versions for a release channel.
                 # This is also publicly accessible at:
                 # https://downloads.okteto.com/cli/<channel>/versions
-                VERSIONS_BUCKET_NAME="downloads.okteto.com/cli/${chan}/versions"
+                VERSIONS_BUCKET_FILENAME="downloads.okteto.com/cli/${chan}/versions"
 
                 # upload artifacts
                 echo "Syncing artifacts from $BIN_PATH with $BIN_BUCKET_NAME"
@@ -155,41 +160,48 @@
                 # It is important to have them sorted so that the last version from the list
                 # is always the latest and we can keep pushing older tags for maintenance and
                 # whatnot.
-                version_temp_file=$(mktemp)
-                gsutil cat "gs://${VERSIONS_BUCKET_NAME}" >"$version_temp_file"
+                version_file="$HOME/versions-${chan}"
+                version_file_tmp=$(mktemp)
+                gsutil cat "gs://${VERSIONS_BUCKET_FILENAME}" >"$version_file_tmp"
                 echo "Current version list for ${chan} channel (showing latest 10):"
-                tail "$version_temp_file" -n 10
+                tail -n 10 "$version_file_tmp"
 
-                printf "%s\n" "${tag}" >>"$version_temp_file"
+                printf "%s\n" "${tag}" >>"$version_file_tmp"
 
                 # dont sort the dev channel. Not all tags are semver and it's
                 # safe to assume linear history
                 if [ "${chan}" = "dev" ]; then
-                        # SC2002: Useless cat. Consider 'cmd < file | ..' or 'cmd file | ..' instead
-                        # shellcheck disable=SC2002
-                        cat "$version_temp_file" >"${BIN_PATH}/versions"
+                        awk '!seen[$0]++' "$version_file_tmp" >"${version_file}"
                 else
-                        # remove duplicated versions and sort the list
-                        # SC2002: Useless cat. Consider 'cmd < file | ..' or 'cmd file | ..' instead
-                        # shellcheck disable=SC2002
-                        cat "$version_temp_file" | awk '!seen[$0]++' | okteto-ci-utils semver-sort >"${BIN_PATH}/versions"
+                        awk '!seen[$0]++' "$version_file_tmp" | perl -pe 's/\-(?=beta)/~/' | sort -V | perl -pe 's/~/-/' >"${version_file}"
                 fi
 
                 echo "Added ${tag} to the version list"
                 echo "New version list for ${chan} channel (showing latest 10):"
-                tail "${BIN_PATH}/versions" -n 10
+                tail -n 10 "${version_file}"
 
                 # After sorting, if the latest tag is the current tag update the root path
                 # with the current binaries
-                latest="$(tail "${BIN_PATH}/versions" -n1)"
+                latest="$(tail -n1 "${version_file}")"
 
                 if [ "$tag" = "$latest" ]; then
-                        gsutil -m rsync "gs://$BIN_BUCKET_NAME" "gs://$BIN_BUCKET_ROOT"
+                        gsutil -m rsync "gs://$BIN_BUCKET_NAME" "gs://$BIN_BUCKET_ROOT_WITH_CHAN"
+
+                        if [ "$is_oficial_release" = true ] ; then
+                                # upload artifacts to bucket root (gs://downloads.okteto.com/cli)
+                                echo "Syncing artifacts from $BIN_PATH with $BIN_BUCKET_ROOT"
+                                gsutil -m rsync -r "$BIN_PATH" "gs://$BIN_BUCKET_ROOT"
+                        fi
                 fi
 
-                gsutil -m -h "Cache-Control: no-store" -h "Content-Type: text/plain" cp "${BIN_PATH}/versions" "gs://${VERSIONS_BUCKET_NAME}"
+                gsutil -m -h "Cache-Control: no-store" -h "Content-Type: text/plain" cp "${version_file}" "gs://${VERSIONS_BUCKET_FILENAME}"
                 echo "${chan} channel updated with ${tag}"
         done
+
+        ################################################################################
+        # Update Github Release
+        ################################################################################
+        preferred_channel="${CHANNELS[0]}"
 
         if [ "$RELEASE_TAG" = "" ]; then
                 echo "No RELEASE_TAG, skipping github release for pseudo tag ${PSEUDO_TAG} from ${CURRENT_BRANCH}"
@@ -197,15 +209,13 @@
                 exit 0
         fi
 
-        ################################################################################
-        # Update Github Release
-        ################################################################################
-        previous_version=$(grep -F "$RELEASE_TAG" -B 1 "${BIN_PATH}/versions" | head -n1)
+        if [ "${preferred_channel}" = "dev" ]; then
+                echo "skipping github release for dev channel for dev pseudo tag ${PSEUDO_TAG} from ${CURRENT_BRANCH}"
+                echo "All done"
+                exit 0
+        fi
 
-        # SC2116: Useless echo? Instead of 'cmd $(echo foo)', just use 'cmd foo'.
-        # SC2128: Expanding an array without an index only gives the first element.
-        # shellcheck disable=SC2116,SC2128
-        preferred_channel="$(echo "$CHANNELS")"
+        previous_version=$(grep -F "$RELEASE_TAG" -B 1 "$HOME/versions-${preferred_channel}" | head -n1)
 
         echo "Gathering ${RELEASE_TAG} release notes. Diffing from ${previous_version}"
         notes=$(curl \
@@ -214,7 +224,7 @@
                 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
                 -H "Accept: application/vnd.github.v3+json" \
                 -d "{\"tag_name\":\"$RELEASE_TAG\",\"previous_tag_name\":\"$previous_version\"}" \
-                "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/generate-notes" | jq .body)
+                "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/generate-notes" | jq -r .body)
 
         printf "RELEASE NOTES:\n%s" "${notes}"
 
@@ -232,7 +242,7 @@
                 -r "${REPO_NAME}" \
                 -c "${RELEASE_COMMIT}" \
                 -token "${GITHUB_TOKEN}" \
-                -b "${notes}" \
+                -b "$(printf "%s" "${notes}")" \
                 -replace \
                 -prerelease="${prerelease}" \
                 "${RELEASE_TAG}" \

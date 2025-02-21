@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,24 +14,30 @@
 package cmd
 
 import (
-	contextCMD "github.com/okteto/okteto/cmd/context"
+	"github.com/okteto/okteto/cmd/context"
 	"github.com/okteto/okteto/cmd/utils"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/types"
 	"github.com/spf13/cobra"
 )
 
+// oktetoClientProvider provides an okteto client ready to use or fail
+type oktetoClientProvider interface {
+	Provide(...okteto.Option) (types.OktetoInterface, error)
+}
+
 // Kubeconfig fetch credentials for a cluster namespace
-func Kubeconfig() *cobra.Command {
+func Kubeconfig(okClientProvider oktetoClientProvider) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "kubeconfig",
 		Short: "Download credentials for the Kubernetes cluster selected via 'okteto context'",
-		Args:  utils.NoArgsAccepted("https://okteto.com/docs/reference/cli/#kubeconfig"),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		Long: `Download credentials for the Kubernetes cluster selected via 'okteto context'.
 
-			err := contextCMD.UpdateKubeconfigCMD().RunE(cmd, args)
-			if err != nil {
-				return err
-			}
-			return err
+Generated kubeconfig file uses a credential plugin to get the cluster credentials via Okteto backend that requires the Okteto CLI to be in the PATH. Learn more about how to use the Kubernetes credentials at https://www.okteto.com/docs/core/credentials/kubernetes-credentials#using-your-kubernetes-credentials.
+`,
+		Args: utils.NoArgsAccepted("https://okteto.com/docs/reference/okteto-cli/#kubeconfig"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return context.UpdateKubeconfigCMD(okClientProvider).RunE(cmd, args)
 		},
 	}
 	return cmd

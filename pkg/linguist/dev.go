@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,27 +14,25 @@
 package linguist
 
 import (
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/okteto/okteto/pkg/env"
 	"github.com/okteto/okteto/pkg/model"
-	"github.com/okteto/okteto/pkg/okteto"
-	"github.com/okteto/okteto/pkg/registry"
+	"github.com/okteto/okteto/pkg/model/forward"
 	apiv1 "k8s.io/api/core/v1"
 )
 
 type languageDefault struct {
+	securityContext *model.SecurityContext
 	image           string
 	path            string
 	command         []string
-	environment     []model.EnvVar
+	environment     []env.Var
 	volumes         []model.Volume
-	forward         []model.Forward
+	forward         []forward.Forward
 	reverse         []model.Reverse
 	remote          int
-	securityContext *model.SecurityContext
 }
 
 const (
@@ -55,23 +53,23 @@ const (
 
 var (
 	languageDefaults map[string]languageDefault
-	forwardDefaults  map[string][]model.Forward
+	forwardDefaults  map[string][]forward.Forward
 )
 
 func init() {
 	languageDefaults = make(map[string]languageDefault)
-	forwardDefaults = make(map[string][]model.Forward)
+	forwardDefaults = make(map[string][]forward.Forward)
 	languageDefaults[Javascript] = languageDefault{
 		image:   "okteto/node:14",
 		path:    "/usr/src/app",
-		command: []string{"bash"}, forward: []model.Forward{
+		command: []string{"bash"}, forward: []forward.Forward{
 			{
 				Local:  9229,
 				Remote: 9229,
 			},
 		},
 	}
-	forwardDefaults[Javascript] = []model.Forward{
+	forwardDefaults[Javascript] = []forward.Forward{
 		{
 			Local:  3000,
 			Remote: 3000,
@@ -87,7 +85,7 @@ func init() {
 				Add: []apiv1.Capability{"SYS_PTRACE"},
 			},
 		},
-		forward: []model.Forward{
+		forward: []forward.Forward{
 			{
 				Local:  2345,
 				Remote: 2345,
@@ -102,7 +100,7 @@ func init() {
 			},
 		},
 	}
-	forwardDefaults[golang] = []model.Forward{
+	forwardDefaults[golang] = []forward.Forward{
 		{
 			Local:  8080,
 			Remote: 8080,
@@ -122,7 +120,7 @@ func init() {
 			},
 		},
 	}
-	forwardDefaults[Rust] = []model.Forward{
+	forwardDefaults[Rust] = []forward.Forward{
 		{
 			Local:  8080,
 			Remote: 8080,
@@ -145,7 +143,7 @@ func init() {
 			},
 		},
 	}
-	forwardDefaults[Python] = []model.Forward{
+	forwardDefaults[Python] = []forward.Forward{
 		{
 			Local:  8080,
 			Remote: 8080,
@@ -156,7 +154,7 @@ func init() {
 		image:   "okteto/gradle:6.5",
 		path:    "/usr/src/app",
 		command: []string{"bash"},
-		forward: []model.Forward{
+		forward: []forward.Forward{
 			{
 				Local:  5005,
 				Remote: 5005,
@@ -168,7 +166,7 @@ func init() {
 			},
 		},
 	}
-	forwardDefaults[Gradle] = []model.Forward{
+	forwardDefaults[Gradle] = []forward.Forward{
 		{
 			Local:  8080,
 			Remote: 8080,
@@ -179,7 +177,7 @@ func init() {
 		image:   "okteto/maven:3",
 		path:    "/usr/src/app",
 		command: []string{"bash"},
-		forward: []model.Forward{
+		forward: []forward.Forward{
 			{
 				Local:  5005,
 				Remote: 5005,
@@ -191,7 +189,7 @@ func init() {
 			},
 		},
 	}
-	forwardDefaults[Maven] = []model.Forward{
+	forwardDefaults[Maven] = []forward.Forward{
 		{
 			Local:  8080,
 			Remote: 8080,
@@ -202,7 +200,7 @@ func init() {
 		image:   "okteto/ruby:2",
 		path:    "/usr/src/app",
 		command: []string{"bash"},
-		forward: []model.Forward{
+		forward: []forward.Forward{
 			{
 				Local:  1234,
 				Remote: 1234,
@@ -214,7 +212,7 @@ func init() {
 			},
 		},
 	}
-	forwardDefaults[Ruby] = []model.Forward{
+	forwardDefaults[Ruby] = []forward.Forward{
 		{
 			Local:  8080,
 			Remote: 8080,
@@ -225,7 +223,7 @@ func init() {
 		image:   "okteto/dotnetcore:3",
 		path:    "/usr/src/app",
 		command: []string{"bash"},
-		environment: []model.EnvVar{
+		environment: []env.Var{
 			{
 				Name:  "ASPNETCORE_ENVIRONMENT",
 				Value: "Development",
@@ -239,10 +237,10 @@ func init() {
 				Value: "0",
 			},
 		},
-		forward: []model.Forward{},
+		forward: []forward.Forward{},
 		remote:  22000,
 	}
-	forwardDefaults[Csharp] = []model.Forward{
+	forwardDefaults[Csharp] = []forward.Forward{
 		{
 			Local:  5000,
 			Remote: 5000,
@@ -265,7 +263,7 @@ func init() {
 			},
 		},
 	}
-	forwardDefaults[Php] = []model.Forward{
+	forwardDefaults[Php] = []forward.Forward{
 		{
 			Local:  8080,
 			Remote: 8080,
@@ -276,9 +274,9 @@ func init() {
 		image:   model.DefaultImage,
 		path:    "/usr/src/app",
 		command: []string{"bash"},
-		forward: []model.Forward{},
+		forward: []forward.Forward{},
 	}
-	forwardDefaults[Unrecognized] = []model.Forward{
+	forwardDefaults[Unrecognized] = []forward.Forward{
 		{
 			Local:  8080,
 			Remote: 8080,
@@ -299,70 +297,6 @@ func GetSupportedLanguages() []string {
 	l = append(l, Unrecognized)
 
 	return l
-}
-
-// GetDevDefaults gets default values for the specified language
-func GetDevDefaults(language, workdir string, imageConfig *registry.ImageConfig) (*model.Dev, error) {
-	language = NormalizeLanguage(language)
-	vals := languageDefaults[language]
-
-	if imageConfig.Workdir == "" || imageConfig.Workdir == "/" {
-		imageConfig.Workdir = vals.path
-	}
-
-	if filepath.IsAbs(workdir) {
-		wd, err := os.Getwd()
-		if err != nil {
-			return nil, err
-		}
-		workdir, err = filepath.Rel(wd, workdir)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	dev := &model.Dev{
-		Image: &model.BuildInfo{
-			Name: vals.image,
-		},
-		Command: model.Command{
-			Values: vals.command,
-		},
-		Environment: vals.environment,
-		Volumes:     vals.volumes,
-		Sync: model.Sync{
-			RescanInterval: model.DefaultSyncthingRescanInterval,
-			Folders: []model.SyncFolder{
-				{
-					LocalPath:  workdir,
-					RemotePath: imageConfig.Workdir,
-				},
-			},
-		},
-		Forward:         vals.forward,
-		Reverse:         vals.reverse,
-		RemotePort:      vals.remote,
-		SecurityContext: vals.securityContext,
-	}
-
-	name, err := model.GetValidNameFromFolder(workdir)
-	if err != nil {
-		return nil, err
-	}
-	dev.Name = name
-	dev.Context = okteto.Context().Name
-	dev.Namespace = okteto.Context().Namespace
-	return dev, nil
-}
-
-// SetForwardDefaults set port forward default values for the specified language
-func SetForwardDefaults(dev *model.Dev, language string) {
-	language = NormalizeLanguage(language)
-	vals := forwardDefaults[language]
-	if dev.Forward == nil {
-		dev.Forward = []model.Forward{}
-	}
-	dev.Forward = append(dev.Forward, vals...)
 }
 
 func NormalizeLanguage(language string) string {

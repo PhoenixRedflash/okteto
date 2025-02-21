@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,28 +14,27 @@
 package deploy
 
 import (
-	"fmt"
-	"os"
-	"strings"
+	"github.com/okteto/okteto/pkg/env"
+	"github.com/okteto/okteto/pkg/validator"
 )
 
-func validateOptionVars(variables []string) error {
-	for _, v := range variables {
-		kv := strings.SplitN(v, "=", 2)
-		if len(kv) != 2 {
-			return fmt.Errorf("invalid variable value '%s': must follow KEY=VALUE format", v)
-		}
-		if err := os.Setenv(kv[0], kv[1]); err != nil {
-			return err
-		}
+// validateAndSet returns error when variables dont have expected format NAME=VALUE or NAME is not allowed
+// when variable is valid, it sets its value as env variable
+func validateAndSet(variables []string, setEnv func(key, value string) error) error {
+	if err := validator.CheckReservedVariablesNameOption(variables); err != nil {
+		return err
 	}
-	return nil
+
+	envVars, err := env.Parse(variables)
+	if err != nil {
+		return err
+	}
+	return setOptionVarsAsEnvs(envVars, setEnv)
 }
 
-func setOptionVarsAsEnvs(variables []string) error {
+func setOptionVarsAsEnvs(variables []env.Var, setEnv func(key, value string) error) error {
 	for _, v := range variables {
-		kv := strings.SplitN(v, "=", 2)
-		if err := os.Setenv(kv[0], kv[1]); err != nil {
+		if err := setEnv(v.Name, v.Value); err != nil {
 			return err
 		}
 	}

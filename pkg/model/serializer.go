@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,8 +15,8 @@ package model
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,33 +26,39 @@ import (
 	"time"
 
 	"github.com/kballard/go-shellquote"
+	"github.com/okteto/okteto/pkg/build"
+	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/deps"
+	"github.com/okteto/okteto/pkg/env"
+	"github.com/okteto/okteto/pkg/externalresource"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	giturls "github.com/whilp/git-urls"
+	"github.com/okteto/okteto/pkg/model/forward"
 	apiv1 "k8s.io/api/core/v1"
-	resource "k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// BuildInfoRaw represents the build info for serialization
-type buildInfoRaw struct {
-	Name             string        `yaml:"name,omitempty"`
-	Context          string        `yaml:"context,omitempty"`
-	Dockerfile       string        `yaml:"dockerfile,omitempty"`
-	CacheFrom        []string      `yaml:"cache_from,omitempty"`
-	Target           string        `yaml:"target,omitempty"`
-	Args             Environment   `yaml:"args,omitempty"`
-	Image            string        `yaml:"image,omitempty"`
-	VolumesToInclude []StackVolume `yaml:"-"`
-	ExportCache      string        `yaml:"export_cache,omitempty"`
-}
+const (
+	maxVolumeParamDefinition   = 3
+	volumeParamsWithSubPath    = 3
+	volumeParamsWithoutSubpath = 2
+	defaultSecretMode          = 420
+)
+
+var (
+
+	// errDevModeNotValid is raised when development mode in manifest is not 'sync' nor 'hybrid'
+	errDevModeNotValid = errors.New("development mode not valid. Value must be one of: ['sync', 'hybrid']")
+)
 
 type syncRaw struct {
-	Compression    bool         `json:"compression" yaml:"compression"`
-	Verbose        bool         `json:"verbose" yaml:"verbose"`
-	RescanInterval int          `json:"rescanInterval,omitempty" yaml:"rescanInterval,omitempty"`
-	Folders        []SyncFolder `json:"folders,omitempty" yaml:"folders,omitempty"`
 	LocalPath      string
 	RemotePath     string
+	Folders        []SyncFolder `json:"folders,omitempty" yaml:"folders,omitempty"`
+	RescanInterval int          `json:"rescanInterval,omitempty" yaml:"rescanInterval,omitempty"`
+	Compression    bool         `json:"compression" yaml:"compression"`
+	Verbose        bool         `json:"verbose" yaml:"verbose"`
 }
 
 type storageResourceRaw struct {
@@ -67,19 +73,13 @@ type probesRaw struct {
 	Startup   bool `json:"startup,omitempty" yaml:"startup,omitempty"`
 }
 
-// lifecycleRaw represents the lifecycle info for serialization
-type lifecycleRaw struct {
-	PostStart bool `json:"postStart,omitempty" yaml:"postStart,omitempty"`
-	PostStop  bool `json:"postStop,omitempty" yaml:"postStop,omitempty"`
-}
-
 type AffinityRaw struct {
 	NodeAffinity    *NodeAffinity    `yaml:"nodeAffinity,omitempty" json:"nodeAffinity,omitempty"`
 	PodAffinity     *PodAffinity     `yaml:"podAffinity,omitempty" json:"podAffinity,omitempty"`
 	PodAntiAffinity *PodAntiAffinity `yaml:"podAntiAffinity,omitempty" json:"podAntiAffinity,omitempty"`
 }
 
-// Describes node affinity scheduling rules for the pod.
+// NodeAffinity describes node affinity scheduling rules for the pod.
 type NodeAffinity struct {
 	RequiredDuringSchedulingIgnoredDuringExecution  *NodeSelector             `yaml:"requiredDuringSchedulingIgnoredDuringExecution,omitempty" json:"requiredDuringSchedulingIgnoredDuringExecution,omitempty"`
 	PreferredDuringSchedulingIgnoredDuringExecution []PreferredSchedulingTerm `yaml:"preferredDuringSchedulingIgnoredDuringExecution,omitempty" json:"preferredDuringSchedulingIgnoredDuringExecution,omitempty"`
@@ -101,19 +101,19 @@ type NodeSelectorRequirement struct {
 }
 
 type PreferredSchedulingTerm struct {
-	// Weight associated with matching the corresponding nodeSelectorTerm, in the range 1-100.
-	Weight int32 `yaml:"weight" json:"weight"`
 	// A node selector term, associated with the corresponding weight.
 	Preference NodeSelectorTerm `yaml:"preference" json:"preference"`
+	// Weight associated with matching the corresponding nodeSelectorTerm, in the range 1-100.
+	Weight int32 `yaml:"weight" json:"weight"`
 }
 
-// Describes pod affinity scheduling rules (e.g. co-locate this pod in the same node, zone, etc. as some other pod(s)).
+// PodAffinity describes pod affinity scheduling rules (e.g. co-locate this pod in the same node, zone, etc. as some other pod(s)).
 type PodAffinity struct {
 	RequiredDuringSchedulingIgnoredDuringExecution  []PodAffinityTerm         `yaml:"requiredDuringSchedulingIgnoredDuringExecution,omitempty" json:"requiredDuringSchedulingIgnoredDuringExecution,omitempty"`
 	PreferredDuringSchedulingIgnoredDuringExecution []WeightedPodAffinityTerm `yaml:"preferredDuringSchedulingIgnoredDuringExecution,omitempty" json:"preferredDuringSchedulingIgnoredDuringExecution,omitempty"`
 }
 
-// Describes pod anti-affinity scheduling rules (e.g. avoid putting this pod in the same node, zone, etc. as some other pod(s)).
+// PodAntiAffinity describes pod anti-affinity scheduling rules (e.g. avoid putting this pod in the same node, zone, etc. as some other pod(s)).
 type PodAntiAffinity struct {
 	RequiredDuringSchedulingIgnoredDuringExecution  []PodAffinityTerm         `yaml:"requiredDuringSchedulingIgnoredDuringExecution,omitempty" json:"requiredDuringSchedulingIgnoredDuringExecution,omitempty"`
 	PreferredDuringSchedulingIgnoredDuringExecution []WeightedPodAffinityTerm `yaml:"preferredDuringSchedulingIgnoredDuringExecution,omitempty" json:"preferredDuringSchedulingIgnoredDuringExecution,omitempty"`
@@ -121,8 +121,8 @@ type PodAntiAffinity struct {
 
 type PodAffinityTerm struct {
 	LabelSelector *LabelSelector `yaml:"labelSelector,omitempty" json:"labelSelector,omitempty"`
-	Namespaces    []string       `yaml:"namespaces,omitempty" json:"namespaces,omitempty"`
 	TopologyKey   string         `yaml:"topologyKey" json:"topologyKey"`
+	Namespaces    []string       `yaml:"namespaces,omitempty" json:"namespaces,omitempty"`
 }
 
 type LabelSelector struct {
@@ -136,39 +136,8 @@ type LabelSelectorRequirement struct {
 }
 
 type WeightedPodAffinityTerm struct {
-	Weight          int32           `yaml:"weight" json:"weight"`
 	PodAffinityTerm PodAffinityTerm `yaml:"podAffinityTerm" json:"podAffinityTerm"`
-}
-
-// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
-func (e *EnvVar) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var raw string
-	err := unmarshal(&raw)
-	if err != nil {
-		return err
-	}
-
-	parts := strings.SplitN(raw, "=", 2)
-	e.Name = parts[0]
-	if len(parts) == 2 {
-		e.Value, err = ExpandEnv(parts[1], true)
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-
-	e.Name, err = ExpandEnv(parts[0], true)
-	if err != nil {
-		return err
-	}
-	e.Value = os.Getenv(e.Name)
-	return nil
-}
-
-// MarshalYAML Implements the marshaler interface of the yaml pkg.
-func (e EnvVar) MarshalYAML() (interface{}, error) {
-	return e.Name + "=" + e.Value, nil
+	Weight          int32           `yaml:"weight" json:"weight"`
 }
 
 // UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
@@ -207,19 +176,21 @@ func (e Entrypoint) MarshalYAML() (interface{}, error) {
 func (c *Command) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var multi []string
 	err := unmarshal(&multi)
-	if err != nil {
-		var single string
-		err := unmarshal(&single)
-		if err != nil {
-			return err
-		}
-		if strings.Contains(single, " ") {
-			c.Values = []string{"sh", "-c", single}
-		} else {
-			c.Values = []string{single}
-		}
-	} else {
+	if err == nil {
 		c.Values = multi
+		return nil
+	}
+
+	var single string
+	err = unmarshal(&single)
+	if err != nil {
+		return err
+	}
+
+	if strings.Contains(single, " ") {
+		c.Values = []string{"sh", "-c", single}
+	} else {
+		c.Values = []string{single}
 	}
 	return nil
 }
@@ -289,49 +260,6 @@ func (sync Sync) MarshalYAML() (interface{}, error) {
 }
 
 // UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
-func (buildInfo *BuildInfo) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var rawString string
-	err := unmarshal(&rawString)
-	if err == nil {
-		buildInfo.Name = rawString
-		return nil
-	}
-
-	var rawBuildInfo buildInfoRaw
-	err = unmarshal(&rawBuildInfo)
-	if err != nil {
-		return err
-	}
-
-	buildInfo.Name = rawBuildInfo.Name
-	buildInfo.Context = rawBuildInfo.Context
-	buildInfo.Dockerfile = rawBuildInfo.Dockerfile
-	buildInfo.Target = rawBuildInfo.Target
-	buildInfo.Args = rawBuildInfo.Args
-	buildInfo.Image = rawBuildInfo.Image
-	buildInfo.CacheFrom = rawBuildInfo.CacheFrom
-	buildInfo.ExportCache = rawBuildInfo.ExportCache
-	return nil
-}
-
-// MarshalYAML Implements the marshaler interface of the yaml pkg.
-func (buildInfo *BuildInfo) MarshalYAML() (interface{}, error) {
-	if buildInfo.Context != "" && buildInfo.Context != "." {
-		return buildInfoRaw(*buildInfo), nil
-	}
-	if buildInfo.Dockerfile != "" && buildInfo.Dockerfile != "./Dockerfile" {
-		return buildInfoRaw(*buildInfo), nil
-	}
-	if buildInfo.Target != "" {
-		return buildInfoRaw(*buildInfo), nil
-	}
-	if buildInfo.Args != nil && len(buildInfo.Args) != 0 {
-		return buildInfoRaw(*buildInfo), nil
-	}
-	return buildInfo.Name, nil
-}
-
-// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
 func (s *StorageResource) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var rawQuantity Quantity
 	err := unmarshal(&rawQuantity)
@@ -387,13 +315,15 @@ func (s *Secret) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 
-	rawExpanded, err := ExpandEnv(raw, true)
+	rawExpanded, err := env.ExpandEnv(raw)
 	if err != nil {
 		return err
 	}
+	secretWithModeLength := 3
+	secretWithoutModeLength := 2
 	parts := strings.Split(rawExpanded, ":")
 	if runtime.GOOS == "windows" {
-		if len(parts) >= 3 {
+		if len(parts) >= secretWithModeLength {
 			localPath := fmt.Sprintf("%s:%s", parts[0], parts[1])
 			if filepath.IsAbs(localPath) {
 				parts = append([]string{localPath}, parts[2:]...)
@@ -401,32 +331,31 @@ func (s *Secret) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		}
 	}
 
-	if len(parts) < 2 || len(parts) > 3 {
-		return fmt.Errorf("secrets must follow the syntax 'LOCAL_PATH:REMOTE_PATH:MODE'")
+	// if the secret is not formatted correctly we return an empty secret (i.e. empty LocalPath and RemotePath)
+	// and we rely on the secret validation to return the appropriate error to the user
+	if len(parts) < secretWithoutModeLength || len(parts) > secretWithModeLength {
+		return nil
 	}
+
 	s.LocalPath = parts[0]
-	if err := checkFileAndNotDirectory(s.LocalPath); err != nil {
-		return err
-	}
 	s.RemotePath = parts[1]
-	if !strings.HasPrefix(s.RemotePath, "/") {
-		return fmt.Errorf("Secret remote path '%s' must be an absolute path", s.RemotePath)
-	}
-	if len(parts) == 3 {
+
+	if len(parts) == secretWithModeLength {
 		mode, err := strconv.ParseInt(parts[2], 8, 32)
 		if err != nil {
-			return fmt.Errorf("error parsing secret '%s' mode: %s", parts[0], err)
+			return fmt.Errorf("error parsing secret '%s' mode: %w", parts[0], err)
 		}
 		s.Mode = int32(mode)
 	} else {
-		s.Mode = 420
+		s.Mode = defaultSecretMode
 	}
+
 	return nil
 }
 
 // MarshalYAML Implements the marshaler interface of the yaml pkg.
 func (s Secret) MarshalYAML() (interface{}, error) {
-	if s.Mode == 420 {
+	if s.Mode == defaultSecretMode {
 		return fmt.Sprintf("%s:%s:%s", s.LocalPath, s.RemotePath, strconv.FormatInt(int64(s.Mode), 8)), nil
 	}
 	return fmt.Sprintf("%s:%s", s.LocalPath, s.RemotePath), nil
@@ -439,19 +368,19 @@ func (f *Reverse) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if err != nil {
 		return err
 	}
-
-	parts := strings.SplitN(raw, ":", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("Wrong port-forward syntax '%s', must be of the form 'localPort:RemotePort'", raw)
+	maxReverseParts := 2
+	parts := strings.SplitN(raw, ":", maxReverseParts)
+	if len(parts) != maxReverseParts {
+		return fmt.Errorf("wrong port-forward syntax '%s', must be of the form 'localPort:RemotePort'", raw)
 	}
 	remotePort, err := strconv.Atoi(parts[0])
 	if err != nil {
-		return fmt.Errorf("Cannot convert remote port '%s' in reverse '%s'", parts[0], raw)
+		return fmt.Errorf("cannot convert remote port '%s' in reverse '%s'", parts[0], raw)
 	}
 
 	localPort, err := strconv.Atoi(parts[1])
 	if err != nil {
-		return fmt.Errorf("Cannot convert local port '%s' in reverse '%s'", parts[1], raw)
+		return fmt.Errorf("cannot convert local port '%s' in reverse '%s'", parts[1], raw)
 	}
 
 	f.Local = localPort
@@ -506,10 +435,11 @@ func (v *Volume) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 
-	parts := strings.SplitN(raw, ":", 2)
-	if len(parts) == 2 {
+	maxVolumeParts := 2
+	parts := strings.SplitN(raw, ":", maxVolumeParts)
+	if len(parts) == maxVolumeParts {
 		oktetoLog.Yellow("The syntax '%s' is deprecated in the 'volumes' field and will be removed in a future version. Use the field 'sync' instead (%s)", raw, syncFieldDocsURL)
-		v.LocalPath, err = ExpandEnv(parts[0], true)
+		v.LocalPath, err = env.ExpandEnv(parts[0])
 		if err != nil {
 			return err
 		}
@@ -533,24 +463,27 @@ func (s *SyncFolder) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 
+	windowsSyncFolderParts := 3
+	syncFolderParts := 2
+
 	parts := strings.Split(raw, ":")
-	if len(parts) == 2 {
-		s.LocalPath, err = ExpandEnv(parts[0], true)
+	if len(parts) == syncFolderParts {
+		s.LocalPath, err = env.ExpandEnv(parts[0])
 		if err != nil {
 			return err
 		}
-		s.RemotePath, err = ExpandEnv(parts[1], true)
+		s.RemotePath, err = env.ExpandEnv(parts[1])
 		if err != nil {
 			return err
 		}
 		return nil
-	} else if len(parts) == 3 {
+	} else if len(parts) == windowsSyncFolderParts {
 		windowsPath := fmt.Sprintf("%s:%s", parts[0], parts[1])
-		s.LocalPath, err = ExpandEnv(windowsPath, true)
+		s.LocalPath, err = env.ExpandEnv(windowsPath)
 		if err != nil {
 			return err
 		}
-		s.RemotePath, err = ExpandEnv(parts[2], true)
+		s.RemotePath, err = env.ExpandEnv(parts[2])
 		if err != nil {
 			return err
 		}
@@ -581,12 +514,12 @@ func (v *ExternalVolume) UnmarshalYAML(unmarshal func(interface{}) error) error 
 		return err
 	}
 
-	parts := strings.SplitN(raw, ":", 3)
+	parts := strings.SplitN(raw, ":", maxVolumeParamDefinition)
 	switch len(parts) {
-	case 2:
+	case volumeParamsWithoutSubpath:
 		v.Name = parts[0]
 		v.MountPath = parts[1]
-	case 3:
+	case volumeParamsWithSubPath:
 		v.Name = parts[0]
 		v.SubPath = parts[1]
 		v.MountPath = parts[2]
@@ -637,167 +570,256 @@ func (p Probes) MarshalYAML() (interface{}, error) {
 
 // UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
 func (l *Lifecycle) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	lifecycle := &Lifecycle{
+		PostStart: &LifecycleHandler{},
+		PreStop:   &LifecycleHandler{},
+	}
 	var rawBool bool
 	err := unmarshal(&rawBool)
 	if err == nil {
-		l.PostStart = rawBool
-		l.PostStop = rawBool
+		lifecycle.PostStart.Enabled = rawBool
+		lifecycle.PreStop.Enabled = rawBool
+		*l = *lifecycle
 		return nil
 	}
 
-	var lifecycleRaw lifecycleRaw
+	type lifecycleRawType Lifecycle
+	var lifecycleRaw lifecycleRawType
 	err = unmarshal(&lifecycleRaw)
 	if err != nil {
 		return err
 	}
 
-	l.PostStart = lifecycleRaw.PostStart
-	l.PostStop = lifecycleRaw.PostStop
+	lifecycle.PostStart = lifecycleRaw.PostStart
+	lifecycle.PreStop = lifecycleRaw.PreStop
+	*l = *lifecycle
 	return nil
 }
 
 // MarshalYAML Implements the marshaler interface of the yaml pkg.
-func (l Lifecycle) MarshalYAML() (interface{}, error) {
-	if l.PostStart && l.PostStop {
+func (l *Lifecycle) MarshalYAML() (interface{}, error) {
+	if l != nil && l.PostStart != nil && l.PostStart.Enabled && l.PreStop != nil && l.PreStop.Enabled && len(l.PostStart.Command.Values) == 0 && len(l.PreStop.Command.Values) == 0 {
 		return true, nil
 	}
-	return lifecycleRaw(l), nil
+	return l, nil
 }
 
-func checkFileAndNotDirectory(path string) error {
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("File '%s' not found. Please make sure the file exists", path)
-	}
-	if fileInfo.Mode().IsRegular() {
+func (lh *LifecycleHandler) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var rawBool bool
+	err := unmarshal(&rawBool)
+	if err == nil {
+		lh.Enabled = rawBool
 		return nil
 	}
-	return fmt.Errorf("Secret '%s' is not a regular file", path)
+
+	type lifecycleHandlerRawType LifecycleHandler
+	var lifecycleHandlerRaw lifecycleHandlerRawType
+	err = unmarshal(&lifecycleHandlerRaw)
+	if err != nil {
+		return err
+	}
+	*lh = LifecycleHandler(lifecycleHandlerRaw)
+	return nil
+}
+
+func (lh *LifecycleHandler) MarshalYAML() (interface{}, error) {
+	if lh != nil && lh.Enabled && len(lh.Command.Values) == 0 {
+		return true, nil
+	}
+	if lh != nil && lh.Enabled && len(lh.Command.Values) > 0 {
+		return lh, nil
+	}
+	return false, nil
+}
+
+type hybridModeInfo struct {
+	Selector          Selector               `json:"selector,omitempty" yaml:"selector,omitempty"`
+	UnsupportedFields map[string]interface{} `yaml:",inline" json:"-"`
+	Workdir           string                 `json:"workdir,omitempty" yaml:"workdir,omitempty"`
+	Mode              string                 `json:"mode,omitempty" yaml:"mode,omitempty"`
+	Forward           []forward.Forward      `json:"forward,omitempty" yaml:"forward,omitempty"`
+	Environment       env.Environment        `json:"environment,omitempty" yaml:"environment,omitempty"`
+	Command           hybridCommand          `json:"command,omitempty" yaml:"command,omitempty"`
+	Reverse           []Reverse              `json:"reverse,omitempty" yaml:"reverse,omitempty"`
+}
+
+type hybridCommand Command
+
+// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
+func (hc *hybridCommand) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var multi []string
+	err := unmarshal(&multi)
+	if err == nil {
+		hc.Values = multi
+		return nil
+	}
+
+	var single string
+	err = unmarshal(&single)
+	if err != nil {
+		return err
+	}
+
+	cmd, err := shellquote.Split(single)
+	if err != nil {
+		return err
+	}
+	hc.Values = cmd
+	return nil
+}
+
+var hybridUnsupportedFields = []string{
+	"affinity",
+	"context",
+	"externalVolumes",
+	"image",
+	"imagePullPolicy",
+	"initContainer",
+	"lifecycle",
+	"namespace",
+	"nodeSelector",
+	"persistentVolume",
+	"replicas",
+	"secrets",
+	"securityContext",
+	"serviceAccount",
+	"sshServerPort",
+	"sync",
+	"tolerations",
+	"volumes",
+}
+
+func (h *hybridModeInfo) warnHybridUnsupportedFields() string {
+	var output string
+
+	var unsupportedFieldsUsed []string
+	for key := range h.UnsupportedFields {
+		for _, unsupportedFieldName := range hybridUnsupportedFields {
+			if key == unsupportedFieldName {
+				unsupportedFieldsUsed = append(unsupportedFieldsUsed, key)
+				break
+			}
+		}
+	}
+
+	sort.Strings(unsupportedFieldsUsed)
+
+	if len(unsupportedFieldsUsed) > 0 {
+		output = fmt.Sprintf("In hybrid mode, the field(s) '%s' specified in your manifest are ignored", strings.Join(unsupportedFieldsUsed, ", "))
+	}
+
+	return output
 }
 
 func (d *Dev) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	type devType Dev //Prevent recursion
+	type devType Dev // Prevent recursion
 	dev := devType(*d)
-	err := unmarshal(&dev)
-	if err != nil {
-		return fmt.Errorf("Unmarshal error: '%s'", err)
+
+	type modeInfo struct {
+		Mode string `json:"mode,omitempty" yaml:"mode,omitempty"`
 	}
+
+	mode := &modeInfo{}
+	err := unmarshal(mode)
+	if err != nil {
+
+		switch mode.Mode {
+		case "", constants.OktetoSyncModeFieldValue:
+		case constants.OktetoHybridModeFieldValue:
+			{
+				hybridModeDev := &hybridModeInfo{}
+				err := unmarshal(hybridModeDev)
+				if err != nil {
+					return err
+				}
+
+				warningMsg := hybridModeDev.warnHybridUnsupportedFields()
+				if warningMsg != "" {
+					oktetoLog.Warning(warningMsg)
+				}
+			}
+		default:
+			{
+				return errDevModeNotValid
+			}
+		}
+	}
+
+	err = unmarshal(&dev)
+	if err != nil {
+		return err
+	}
+
+	if dev.Mode == constants.OktetoHybridModeFieldValue {
+		localDir, err := filepath.Abs(dev.Workdir)
+		if err != nil {
+			return err
+		}
+		info, err := os.Stat(localDir)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("dev workdir is not a dir")
+		}
+		dev.Workdir = localDir
+		dev.Image = config.NewImageConfig(oktetoLog.GetOutputWriter()).GetOktetoImage()
+		dev.ImagePullPolicy = apiv1.PullIfNotPresent
+
+	} else {
+		dev.Mode = constants.OktetoSyncModeFieldValue
+	}
+
 	*d = Dev(dev)
 
 	return nil
 }
 
 type manifestRaw struct {
-	Name         string               `json:"name,omitempty" yaml:"name,omitempty"`
-	Namespace    string               `json:"namespace,omitempty" yaml:"namespace,omitempty"`
-	Context      string               `json:"context,omitempty" yaml:"context,omitempty"`
-	Icon         string               `json:"icon,omitempty" yaml:"icon,omitempty"`
-	Deploy       *DeployInfo          `json:"deploy,omitempty" yaml:"deploy,omitempty"`
-	Dev          ManifestDevs         `json:"dev,omitempty" yaml:"dev,omitempty"`
-	Destroy      []DeployCommand      `json:"destroy,omitempty" yaml:"destroy,omitempty"`
-	Build        ManifestBuild        `json:"build,omitempty" yaml:"build,omitempty"`
-	Dependencies ManifestDependencies `json:"dependencies,omitempty" yaml:"dependencies,omitempty"`
-
-	DeprecatedDevs []string `yaml:"devs"`
+	Deploy        *DeployInfo              `json:"deploy,omitempty" yaml:"deploy,omitempty"`
+	Dev           ManifestDevs             `json:"dev,omitempty" yaml:"dev,omitempty"`
+	Test          ManifestTests            `json:"test,omitempty" yaml:"test,omitempty"`
+	Destroy       *DestroyInfo             `json:"destroy,omitempty" yaml:"destroy,omitempty"`
+	Build         build.ManifestBuild      `json:"build,omitempty" yaml:"build,omitempty"`
+	Dependencies  deps.ManifestSection     `json:"dependencies,omitempty" yaml:"dependencies,omitempty"`
+	External      externalresource.Section `json:"external,omitempty" yaml:"external,omitempty"`
+	Name          string                   `json:"name,omitempty" yaml:"name,omitempty"`
+	Icon          string                   `json:"icon,omitempty" yaml:"icon,omitempty"`
+	GlobalForward []forward.GlobalForward  `json:"forward,omitempty" yaml:"forward,omitempty"`
 }
 
-type dependenciesRaw struct {
-	Repository   string      `json:"repository,omitempty" yaml:"repository,omitempty"`
-	ManifestPath string      `json:"manifest,omitempty" yaml:"manifest,omitempty"`
-	Branch       string      `json:"branch,omitempty" yaml:"branch,omitempty"`
-	Variables    Environment `json:"variables,omitempty" yaml:"variables,omitempty"`
-	Wait         bool        `json:"wait,omitempty" yaml:"wait,omitempty"`
-}
-
-func getRepoNameFromGitURL(repo *url.URL) string {
-	repoPath := strings.Split(strings.TrimPrefix(repo.Path, "/"), "/")
-	return strings.ReplaceAll(repoPath[1], ".git", "")
-}
-
-// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
-func (md *ManifestDependencies) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var rawList []string
-	err := unmarshal(&rawList)
-	if err == nil {
-		rawMd := ManifestDependencies{}
-		for _, repo := range rawList {
-			r, err := giturls.Parse(repo)
-			if err != nil {
-				return err
-			}
-			name := getRepoNameFromGitURL(r)
-			rawMd[name] = &Dependency{
-				Repository: r.String(),
-			}
-		}
-		*md = rawMd
-		return nil
-	}
-
-	type manifestDependencies ManifestDependencies
-	var rawMap manifestDependencies
-	err = unmarshal(&rawMap)
-	if err != nil {
-		return err
-	}
-	*md = ManifestDependencies(rawMap)
-	return nil
-}
-
-// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
-func (dependency *Dependency) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var rawString string
-	err := unmarshal(&rawString)
-	if err == nil {
-		dependency.Repository = rawString
-		return nil
-	}
-
-	var rawDependency dependenciesRaw
-	err = unmarshal(&rawDependency)
-	if err != nil {
-		return err
-	}
-
-	dependency.Repository = rawDependency.Repository
-	dependency.ManifestPath = rawDependency.ManifestPath
-	dependency.Branch = rawDependency.Branch
-	dependency.Variables = rawDependency.Variables
-	dependency.Wait = rawDependency.Wait
-
-	return nil
-}
-
-func (d *Manifest) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	dev := NewDev()
-	err := unmarshal(&dev)
-	if err == nil {
-		*d = *NewManifestFromDev(dev)
-		return nil
-	}
-	if !isManifestFieldNotFound(err) {
-		return err
-	}
-
+func (m *Manifest) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	manifest := manifestRaw{
 		Dev:          map[string]*Dev{},
-		Build:        map[string]*BuildInfo{},
-		Dependencies: map[string]*Dependency{},
+		Build:        map[string]*build.Info{},
+		Dependencies: deps.ManifestSection{},
+		External:     externalresource.Section{},
 	}
-	err = unmarshal(&manifest)
+	err := unmarshal(&manifest)
 	if err != nil {
 		return err
 	}
-	d.Deploy = manifest.Deploy
-	d.Destroy = manifest.Destroy
-	d.Dev = manifest.Dev
-	d.Icon = manifest.Icon
-	d.Build = manifest.Build
-	d.Namespace = manifest.Namespace
-	d.Context = manifest.Context
-	d.IsV2 = true
-	d.Dependencies = manifest.Dependencies
-	d.Name = manifest.Name
+	if manifest.Deploy != nil {
+		m.Deploy = manifest.Deploy
+	}
+	m.Destroy = manifest.Destroy
+	m.Dev = manifest.Dev
+	m.Icon = manifest.Icon
+	m.Build = manifest.Build
+	m.Dependencies = manifest.Dependencies
+	m.Name = manifest.Name
+	if manifest.GlobalForward != nil {
+		m.GlobalForward = manifest.GlobalForward
+	}
+	m.External = manifest.External
+	if manifest.Test != nil {
+		m.Test = manifest.Test
+	}
+	err = m.SanitizeSvcNames()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -810,7 +832,7 @@ func (d *DeployCommand) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return nil
 	}
 
-	//prevent recursion
+	// prevent recursion
 	type deployCommand DeployCommand
 	var extendedCommand deployCommand
 	err = unmarshal(&extendedCommand)
@@ -832,12 +854,16 @@ func (d *DeployInfo) MarshalYAML() (interface{}, error) {
 		}
 	}
 	if isCommandList {
-		result := []string{}
+		var result []string
 		for _, cmd := range d.Commands {
 			result = append(result, cmd.Command)
 		}
 		return result, nil
 	}
+	if d.Context == "" {
+		d.Context = "."
+	}
+
 	return d, nil
 }
 
@@ -866,6 +892,7 @@ func (d *DeployInfo) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if err != nil {
 		return err
 	}
+
 	*d = DeployInfo(deploy)
 	return nil
 }
@@ -985,23 +1012,73 @@ func (d *ManifestDevs) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 	result := ManifestDevs{}
-	for k, v := range devs {
-		dev := Dev(v)
+
+	for i := range devs {
+		dev := Dev(devs[i])
 		devPointer := &dev
-		result[k] = devPointer
+		result[i] = devPointer
 	}
 	*d = result
 	return nil
 }
 
-func isManifestFieldNotFound(err error) bool {
-	manifestFields := []string{"devs", "dev", "name", "icon", "variables", "deploy", "destroy", "build", "namespace", "context"}
-	for _, field := range manifestFields {
-		if strings.Contains(err.Error(), fmt.Sprintf("field %s not found", field)) {
-			return true
+func (d *DestroyInfo) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var commandsString []string
+	err := unmarshal(&commandsString)
+	if err == nil {
+		d.Commands = []DeployCommand{}
+		for _, cmdString := range commandsString {
+			d.Commands = append(d.Commands, DeployCommand{
+				Name:    cmdString,
+				Command: cmdString,
+			})
+		}
+		return nil
+	}
+	var commands []DeployCommand
+	err = unmarshal(&commands)
+	if err == nil {
+		d.Commands = commands
+		return nil
+	}
+	type destroyInfoRaw DestroyInfo
+	var destroy destroyInfoRaw
+	err = unmarshal(&destroy)
+	if err != nil {
+		return err
+	}
+
+	if d.Context == "" {
+		d.Context = "."
+	}
+
+	*d = DestroyInfo(destroy)
+	return nil
+}
+
+func (d *DestroyInfo) MarshalYAML() (interface{}, error) {
+	isCommandList := true
+	for _, cmd := range d.Commands {
+		if cmd.Command != cmd.Name {
+			isCommandList = false
 		}
 	}
-	return false
+	if isCommandList {
+		var result []string
+		for _, cmd := range d.Commands {
+			result = append(result, cmd.Command)
+		}
+		return result, nil
+	}
+	return d, nil
+}
+
+func (m *Manifest) MarshalYAML() (interface{}, error) {
+	if m.Destroy == nil || len(m.Destroy.Commands) == 0 {
+		m.Destroy = nil
+		return m, nil
+	}
+	return m, nil
 }
 
 func (d *Dev) MarshalYAML() (interface{}, error) {
@@ -1010,23 +1087,17 @@ func (d *Dev) MarshalYAML() (interface{}, error) {
 	if isDefaultProbes(d) {
 		toMarshall.Probes = nil
 	}
-	if areAllProbesEnabled(d.Probes) {
-		toMarshall.Probes = nil
-		toMarshall.Healthchecks = true
-	}
 	if d.AreDefaultPersistentVolumeValues() {
 		toMarshall.PersistentVolumeInfo = nil
 	}
 	if toMarshall.ImagePullPolicy == apiv1.PullAlways {
 		toMarshall.ImagePullPolicy = ""
 	}
-	if toMarshall.Lifecycle != nil && (!toMarshall.Lifecycle.PostStart || !toMarshall.Lifecycle.PostStop) {
-		toMarshall.Lifecycle = nil
-	}
+
 	if toMarshall.Metadata != nil && len(toMarshall.Metadata.Annotations) == 0 && len(toMarshall.Metadata.Labels) == 0 {
 		toMarshall.Metadata = nil
 	}
-	if toMarshall.InitContainer.Image == OktetoBinImageTag {
+	if toMarshall.InitContainer.Image == config.NewImageConfig(oktetoLog.GetOutputWriter()).GetBinImage() {
 		toMarshall.InitContainer.Image = ""
 	}
 	if toMarshall.Timeout.Default == 1*time.Minute && toMarshall.Timeout.Resources == 2*time.Minute {
@@ -1137,26 +1208,10 @@ func (a *Annotations) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-func (e *Environment) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	envs := make(Environment, 0)
-	result, err := getKeyValue(unmarshal)
-	if err != nil {
-		return err
-	}
-	for key, value := range result {
-		envs = append(envs, EnvVar{Name: key, Value: value})
-	}
-	sort.SliceStable(envs, func(i, j int) bool {
-		return strings.Compare(envs[i].Name, envs[j].Name) < 0
-	})
-	*e = envs
-	return nil
-}
-
 func getKeyValue(unmarshal func(interface{}) error) (map[string]string, error) {
 	result := make(map[string]string)
 
-	var rawList []EnvVar
+	var rawList []env.Var
 	err := unmarshal(&rawList)
 	if err == nil {
 		for _, label := range rawList {
@@ -1170,34 +1225,13 @@ func getKeyValue(unmarshal func(interface{}) error) (map[string]string, error) {
 		return nil, err
 	}
 	for key, value := range rawMap {
-		value, err = ExpandEnv(value, true)
+		value, err = env.ExpandEnv(value)
 		if err != nil {
 			return nil, err
 		}
 		result[key] = value
 	}
 	return result, nil
-}
-
-// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
-func (envFiles *EnvFiles) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	result := make(EnvFiles, 0)
-	var single string
-	err := unmarshal(&single)
-	if err != nil {
-		var multi []string
-		err := unmarshal(&multi)
-		if err != nil {
-			return err
-		}
-		result = multi
-		*envFiles = result
-		return nil
-	}
-
-	result = append(result, single)
-	*envFiles = result
-	return nil
 }
 
 // UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.

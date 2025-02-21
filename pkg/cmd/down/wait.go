@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -24,18 +24,18 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-func waitForDevPodsTermination(ctx context.Context, c kubernetes.Interface, d *model.Dev, t int) {
+func waitForDevPodsTermination(ctx context.Context, c kubernetes.Interface, d *model.Dev, namespace string, t int) {
 	interactive := map[string]string{model.InteractiveDevLabel: d.Name}
 	detached := map[string]string{model.DetachedDevLabel: d.Name}
 
 	wg := &sync.WaitGroup{}
 
 	wg.Add(1)
-	go _waitForDevPodsTermination(ctx, c, d.Namespace, interactive, wg, t)
+	go _waitForDevPodsTermination(ctx, c, namespace, interactive, wg, t)
 
 	if len(d.Services) > 0 {
 		wg.Add(1)
-		go _waitForDevPodsTermination(ctx, c, d.Namespace, detached, wg, t)
+		go _waitForDevPodsTermination(ctx, c, namespace, detached, wg, t)
 	}
 
 	wg.Wait()

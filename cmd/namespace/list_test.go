@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,9 +27,9 @@ import (
 func Test_listNamespace(t *testing.T) {
 	ctx := context.Background()
 	var tests = []struct {
+		err               error
 		name              string
 		currentNamespaces []types.Namespace
-		err               error
 	}{
 		{
 			name: "List all ns",
@@ -51,8 +51,8 @@ func Test_listNamespace(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			okteto.CurrentStore = &okteto.OktetoContextStore{
-				Contexts: map[string]*okteto.OktetoContext{
+			okteto.CurrentStore = &okteto.ContextStore{
+				Contexts: map[string]*okteto.Context{
 					"test": {
 						Name:     "test",
 						Token:    "test",
@@ -67,10 +67,9 @@ func Test_listNamespace(t *testing.T) {
 			}
 			fakeOktetoClient := &client.FakeOktetoClient{
 				Namespace: client.NewFakeNamespaceClient(tt.currentNamespaces, tt.err),
-				Preview:   client.NewFakePreviewClient(nil, nil),
 				Users:     client.NewFakeUsersClient(usr),
 			}
-			nsCmd := &NamespaceCommand{
+			nsCmd := &Command{
 				okClient: fakeOktetoClient,
 				ctxCmd:   newFakeContextCommand(fakeOktetoClient, usr),
 			}

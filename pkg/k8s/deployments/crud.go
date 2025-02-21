@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,8 +20,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/okteto/okteto/pkg/constants"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
-	"github.com/okteto/okteto/pkg/k8s/labels"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,34 +29,34 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 type patchAnnotations struct {
+	Value map[string]string `json:"value"`
 	Op    string            `json:"op"`
 	Path  string            `json:"path"`
-	Value map[string]string `json:"value"`
 }
 
 // Sandbox returns a base deployment for a dev
-func Sandbox(dev *model.Dev) *appsv1.Deployment {
-	image := dev.Image.Name
+func Sandbox(dev *model.Dev, namespace string) *appsv1.Deployment {
+	image := dev.Image
 	if image == "" {
 		image = model.DefaultImage
 	}
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      dev.Name,
-			Namespace: dev.Namespace,
+			Namespace: namespace,
 			Labels: model.Labels{
-				model.DevLabel: "true",
+				constants.DevLabel: "true",
 			},
 			Annotations: model.Annotations{
 				model.OktetoAutoCreateAnnotation: model.OktetoUpCmd,
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: pointer.Int32Ptr(1),
+			Replicas: ptr.To(int32(1)),
 			Strategy: appsv1.DeploymentStrategy{
 				Type: appsv1.RecreateDeploymentStrategyType,
 			},
@@ -74,7 +74,8 @@ func Sandbox(dev *model.Dev) *appsv1.Deployment {
 				},
 				Spec: apiv1.PodSpec{
 					ServiceAccountName:            dev.ServiceAccount,
-					TerminationGracePeriodSeconds: pointer.Int64Ptr(0),
+					PriorityClassName:             dev.PriorityClassName,
+					TerminationGracePeriodSeconds: ptr.To(int64(0)),
 					Containers: []apiv1.Container{
 						{
 							Name:            "dev",
@@ -88,7 +89,7 @@ func Sandbox(dev *model.Dev) *appsv1.Deployment {
 	}
 }
 
-//List returns the list of deployments
+// List returns the list of deployments
 func List(ctx context.Context, namespace, labels string, c kubernetes.Interface) ([]appsv1.Deployment, error) {
 	dList, err := c.AppsV1().Deployments(namespace).List(
 		ctx,
@@ -102,12 +103,12 @@ func List(ctx context.Context, namespace, labels string, c kubernetes.Interface)
 	return dList.Items, nil
 }
 
-//Get returns a deployment object by name
+// Get returns a deployment object by name
 func Get(ctx context.Context, name, namespace string, c kubernetes.Interface) (*appsv1.Deployment, error) {
 	return c.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 }
 
-//GetByDev returns a deployment object given a dev struct (by name or by label)
+// GetByDev returns a deployment object given a dev struct (by name or by label)
 func GetByDev(ctx context.Context, dev *model.Dev, namespace string, c kubernetes.Interface) (*appsv1.Deployment, error) {
 	if len(dev.Selector) == 0 {
 		return Get(ctx, dev.Name, namespace, c)
@@ -131,13 +132,16 @@ func GetByDev(ctx context.Context, dev *model.Dev, namespace string, c kubernete
 			validDeployments = append(validDeployments, &dList.Items[i])
 		}
 	}
+	if len(validDeployments) == 0 {
+		return nil, oktetoErrors.ErrNotFound
+	}
 	if len(validDeployments) > 1 {
 		return nil, fmt.Errorf("found '%d' deployments for labels '%s' instead of 1", len(validDeployments), dev.LabelsSelector())
 	}
 	return validDeployments[0], nil
 }
 
-//CheckConditionErrors checks errors in conditions
+// CheckConditionErrors checks errors in conditions
 func CheckConditionErrors(deployment *appsv1.Deployment, dev *model.Dev) error {
 	for _, c := range deployment.Status.Conditions {
 		if c.Type == appsv1.DeploymentReplicaFailure && c.Reason == "FailedCreate" && c.Status == apiv1.ConditionTrue {
@@ -153,7 +157,7 @@ func CheckConditionErrors(deployment *appsv1.Deployment, dev *model.Dev) error {
 			} else if isResourcesRelatedError(c.Message) {
 				return getResourceLimitError(c.Message, dev)
 			}
-			return fmt.Errorf(c.Message)
+			return fmt.Errorf("%s", c.Message)
 		}
 	}
 	return nil
@@ -168,28 +172,39 @@ func isResourcesRelatedError(errorMessage string) bool {
 
 func getResourceLimitError(errorMessage string, dev *model.Dev) error {
 	var errorToReturn string
+	var regexMaxSubstring = 2
 	if strings.Contains(errorMessage, "maximum cpu usage") {
-		cpuMaximumRegex, _ := regexp.Compile(`cpu usage per Pod is (\d*\w*)`)
-		maximumCpuPerPod := cpuMaximumRegex.FindStringSubmatch(errorMessage)[1]
-		var manifestCpu string
-		if limitCpu, ok := dev.Resources.Limits[apiv1.ResourceCPU]; ok {
-			manifestCpu = limitCpu.String()
+		cpuMaximumRegex := regexp.MustCompile(`cpu usage per Pod is (\d*\w*)`)
+		maximumCpuPerPodMatchGroups := cpuMaximumRegex.FindStringSubmatch(errorMessage)
+		if len(maximumCpuPerPodMatchGroups) < regexMaxSubstring {
+			errorToReturn += "The value of resources.limits.cpu in your okteto manifest exceeds the maximum CPU limit per pod. "
+		} else {
+			var manifestCpu string
+			if limitCpu, ok := dev.Resources.Limits[apiv1.ResourceCPU]; ok {
+				manifestCpu = limitCpu.String()
+			}
+			maximumCpuPerPod := maximumCpuPerPodMatchGroups[1]
+			errorToReturn += fmt.Sprintf("The value of resources.limits.cpu in your okteto manifest (%s) exceeds the maximum CPU limit per pod (%s). ", manifestCpu, maximumCpuPerPod)
 		}
-		errorToReturn += fmt.Sprintf("The value of resources.limits.cpu in your okteto manifest (%s) exceeds the maximum CPU limit per pod (%s). ", manifestCpu, maximumCpuPerPod)
 	}
 	if strings.Contains(errorMessage, "maximum memory usage") {
-		memoryMaximumRegex, _ := regexp.Compile(`memory usage per Pod is (\d*\w*)`)
-		maximumMemoryPerPod := memoryMaximumRegex.FindStringSubmatch(errorMessage)[1]
-		var manifestMemory string
-		if limitMemory, ok := dev.Resources.Limits[apiv1.ResourceMemory]; ok {
-			manifestMemory = limitMemory.String()
+		memoryMaximumRegex := regexp.MustCompile(`memory usage per Pod is (\d*\w*)`)
+		maximumMemoryPerPodMatchGroups := memoryMaximumRegex.FindStringSubmatch(errorMessage)
+		if len(maximumMemoryPerPodMatchGroups) < regexMaxSubstring {
+			errorToReturn += "The value of resources.limits.memory in your okteto manifest exceeds the maximum memory limit per pod."
+		} else {
+			var manifestMemory string
+			if limitMemory, ok := dev.Resources.Limits[apiv1.ResourceMemory]; ok {
+				manifestMemory = limitMemory.String()
+			}
+			maximumMemoryPerPod := maximumMemoryPerPodMatchGroups[1]
+			errorToReturn += fmt.Sprintf("The value of resources.limits.memory in your okteto manifest (%s) exceeds the maximum memory limit per pod (%s). ", manifestMemory, maximumMemoryPerPod)
 		}
-		errorToReturn += fmt.Sprintf("The value of resources.limits.memory in your okteto manifest (%s) exceeds the maximum memory limit per pod (%s). ", manifestMemory, maximumMemoryPerPod)
 	}
-	return fmt.Errorf(strings.TrimSpace(errorToReturn))
+	return fmt.Errorf("%s", strings.TrimSpace(errorToReturn))
 }
 
-//Deploy creates or updates a deployment
+// Deploy creates or updates a deployment
 func Deploy(ctx context.Context, d *appsv1.Deployment, c kubernetes.Interface) (*appsv1.Deployment, error) {
 	d.ResourceVersion = ""
 	result, err := c.AppsV1().Deployments(d.Namespace).Update(ctx, d, metav1.UpdateOptions{})
@@ -204,21 +219,16 @@ func Deploy(ctx context.Context, d *appsv1.Deployment, c kubernetes.Interface) (
 	return c.AppsV1().Deployments(d.Namespace).Create(ctx, d, metav1.CreateOptions{})
 }
 
-//IsDevModeOn returns if a deployment is in devmode
-func IsDevModeOn(d *appsv1.Deployment) bool {
-	return labels.Get(d.GetObjectMeta(), model.DevLabel) != ""
-}
-
-//Destroy destroys a k8s deployment
+// Destroy destroys a k8s deployment
 func Destroy(ctx context.Context, name, namespace string, c kubernetes.Interface) error {
 	oktetoLog.Infof("deleting deployment '%s'", name)
 	dClient := c.AppsV1().Deployments(namespace)
-	err := dClient.Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: pointer.Int64Ptr(0)})
+	err := dClient.Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: ptr.To(int64(0))})
 	if err != nil {
 		if oktetoErrors.IsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("error deleting kubernetes deployment: %s", err)
+		return fmt.Errorf("error deleting kubernetes deployment: %w", err)
 	}
 	oktetoLog.Infof("deployment '%s' deleted", name)
 	return nil

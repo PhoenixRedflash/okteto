@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,24 +19,22 @@ import (
 
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
-	"k8s.io/client-go/kubernetes"
-
 	networkingv1 "k8s.io/api/networking/v1"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 func Deploy(ctx context.Context, i *networkingv1.Ingress, c kubernetes.Interface) error {
 	old, err := Get(ctx, i.Name, i.Namespace, c)
 	if err != nil && !oktetoErrors.IsNotFound(err) {
-		return fmt.Errorf("error getting kubernetes ingress: %s", err)
+		return fmt.Errorf("error getting kubernetes ingress: %w", err)
 	}
 
 	if old == nil || old.Name == "" {
 		oktetoLog.Infof("creating ingress '%s'", i.Name)
 		_, err = c.NetworkingV1().Ingresses(i.Namespace).Create(ctx, i, metav1.CreateOptions{})
 		if err != nil {
-			return fmt.Errorf("error creating kubernetes ingress: %s", err)
+			return fmt.Errorf("error creating kubernetes ingress: %w", err)
 		}
 		oktetoLog.Infof("created ingress '%s'", i.Name)
 	} else {
@@ -46,7 +44,7 @@ func Deploy(ctx context.Context, i *networkingv1.Ingress, c kubernetes.Interface
 		old.Spec = i.Spec
 		_, err = c.NetworkingV1().Ingresses(i.Namespace).Update(ctx, old, metav1.UpdateOptions{})
 		if err != nil {
-			return fmt.Errorf("error updating kubernetes ingress: %s", err)
+			return fmt.Errorf("error updating kubernetes ingress: %w", err)
 		}
 		oktetoLog.Infof("updated ingress '%s'.", i.Name)
 	}
@@ -79,7 +77,7 @@ func Destroy(ctx context.Context, name, namespace string, c kubernetes.Interface
 		if oktetoErrors.IsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("error deleting kubernetes ingress: %s", err)
+		return fmt.Errorf("error deleting kubernetes ingress: %w", err)
 	}
 	oktetoLog.Infof("Ingress '%s' deleted", name)
 	return nil

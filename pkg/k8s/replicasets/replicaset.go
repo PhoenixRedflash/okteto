@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -28,7 +28,7 @@ import (
 func GetReplicaSetByDeployment(ctx context.Context, d *appsv1.Deployment, c kubernetes.Interface) (*appsv1.ReplicaSet, error) {
 	rsList, err := c.AppsV1().ReplicaSets(d.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get replicasets: %v", err)
+		return nil, fmt.Errorf("failed to get replicasets: %w", err)
 	}
 
 	for i := range rsList.Items {

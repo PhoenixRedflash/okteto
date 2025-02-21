@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,60 +17,125 @@ import (
 	"context"
 	"testing"
 
-	"github.com/okteto/okteto/internal/test"
+	"github.com/okteto/okteto/pkg/build"
 	"github.com/okteto/okteto/pkg/model"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestAllServicesAlreadyBuilt(t *testing.T) {
-	fakeReg := test.NewFakeOktetoRegistry(nil)
-	bc := &OktetoBuilder{
-		Registry: fakeReg,
+func TestNoneOfTheServicesBuilt(t *testing.T) {
+	fakeReg := newFakeRegistry()
+	fakeConfig := fakeConfig{
+		isOkteto: true,
 	}
+	bc := NewFakeBuilder(nil, fakeReg, fakeConfig)
 	alreadyBuilt := []string{}
-	fakeReg.AddImageByName(alreadyBuilt...)
+	require.NoError(t, fakeReg.AddImageByName(alreadyBuilt...))
 	ctx := context.Background()
-	toBuild, err := bc.GetServicesToBuild(ctx, fakeManifest, []string{"test-1", "test-2"})
-	//should not throw error
-	assert.NoError(t, err)
-	assert.Equal(t, len(fakeManifest.Build)-len(alreadyBuilt), len(toBuild))
+	toBuild, err := bc.GetServicesToBuildDuringExecution(ctx, fakeManifest, []string{})
+	// should not throw error
+	require.NoError(t, err)
+	require.Equal(t, len(fakeManifest.Build)-len(alreadyBuilt), len(toBuild))
+}
+
+func TestAllServicesAlreadyBuilt(t *testing.T) {
+	fakeReg := newFakeRegistry()
+	fakeConfig := fakeConfig{
+		isOkteto: true,
+	}
+	bc := NewFakeBuilder(nil, fakeReg, fakeConfig)
+	alreadyBuilt := []string{"test/test-1", "test/test-2", "okteto.dev/test-test-3:okteto", "okteto.dev/test-test-4:okteto"}
+	require.NoError(t, fakeReg.AddImageByName(alreadyBuilt...))
+	ctx := context.Background()
+	toBuild, err := bc.GetServicesToBuildDuringExecution(ctx, fakeManifest, []string{})
+	// should not throw error
+	require.NoError(t, err)
+	require.Equal(t, len(fakeManifest.Build)-len(alreadyBuilt), len(toBuild))
 }
 
 func TestServicesNotAreAlreadyBuilt(t *testing.T) {
-	fakeReg := test.NewFakeOktetoRegistry(nil)
-	bc := &OktetoBuilder{
-		Registry: fakeReg,
+	fakeReg := newFakeRegistry()
+	fakeConfig := fakeConfig{
+		isOkteto: true,
 	}
+	bc := NewFakeBuilder(nil, fakeReg, fakeConfig)
 	alreadyBuilt := []string{"test/test-1"}
-	fakeReg.AddImageByName(alreadyBuilt...)
+	require.NoError(t, fakeReg.AddImageByName(alreadyBuilt...))
 	ctx := context.Background()
-	toBuild, err := bc.GetServicesToBuild(ctx, fakeManifest, []string{"test-1", "test-2"})
-	//should not throw error
-	assert.NoError(t, err)
-	assert.Equal(t, len(fakeManifest.Build)-len(alreadyBuilt), len(toBuild))
+	toBuildSvcsInput := []string{"test-1", "test-2"}
+	toBuild, err := bc.GetServicesToBuildDuringExecution(ctx, fakeManifest, toBuildSvcsInput)
+	// should not throw error
+	require.NoError(t, err)
+	require.Equal(t, len(toBuildSvcsInput)-len(alreadyBuilt), len(toBuild))
 }
 
 func TestNoServiceBuilt(t *testing.T) {
-	fakeReg := test.NewFakeOktetoRegistry(nil)
-	bc := &OktetoBuilder{
-		Registry: fakeReg,
+	fakeReg := newFakeRegistry()
+	fakeConfig := fakeConfig{
+		isOkteto: true,
 	}
-	alreadyBuilt := []string{"test/test-1", "test/test-2"}
-	fakeReg.AddImageByName(alreadyBuilt...)
+	bc := NewFakeBuilder(nil, fakeReg, fakeConfig)
+	alreadyBuilt := []string{"test/test-1"}
+	require.NoError(t, fakeReg.AddImageByName(alreadyBuilt...))
 	ctx := context.Background()
-	toBuild, err := bc.GetServicesToBuild(ctx, fakeManifest, []string{"test-1", "test-2"})
-	//should not throw error
-	assert.NoError(t, err)
-	assert.Equal(t, len(fakeManifest.Build)-len(alreadyBuilt), len(toBuild))
+	toBuildSvcsInput := []string{"test-1"}
+	toBuild, err := bc.GetServicesToBuildDuringExecution(ctx, fakeManifest, toBuildSvcsInput)
+	// should not throw error
+	require.NoError(t, err)
+	require.Equal(t, len(toBuildSvcsInput)-len(alreadyBuilt), len(toBuild))
 }
 
 func TestServicesNotInStack(t *testing.T) {
-	fakeReg := test.NewFakeOktetoRegistry(nil)
-	bc := &OktetoBuilder{
-		Registry: fakeReg,
+	fakeReg := newFakeRegistry()
+	fakeConfig := fakeConfig{
+		isOkteto: false,
 	}
+	bc := NewFakeBuilder(nil, fakeReg, fakeConfig)
+	alreadyBuilt := []string{}
+	require.NoError(t, fakeReg.AddImageByName(alreadyBuilt...))
+	ctx := context.Background()
+	stack := &model.Stack{
+		Services: map[string]*model.Service{
+			"test-not-stack": {
+				Build: &build.Info{
+					Image:   "test",
+					Context: ".",
+				},
+			},
+			"test-1": {
+				Build: &build.Info{
+					Image:   "test-2",
+					Context: ".",
+					VolumesToInclude: []build.VolumeMounts{
+						{
+							LocalPath:  "test",
+							RemotePath: "test",
+						},
+					},
+				},
+			},
+		},
+	}
+	fakeManifest := &model.Manifest{
+		Deploy: &model.DeployInfo{ComposeSection: &model.ComposeSectionInfo{
+			Stack: stack,
+		}},
+	}
+	toBuildSvcsInput := []string{}
+
+	toBuild, err := bc.GetServicesToBuildDuringExecution(ctx, fakeManifest, toBuildSvcsInput)
+	// should not throw error
+	require.NoError(t, err)
+	require.Equal(t, 0, len(toBuild))
+}
+
+func TestServicesNotOktetoWithStack(t *testing.T) {
+	fakeReg := newFakeRegistry()
+	fakeConfig := fakeConfig{
+		isOkteto: true,
+	}
+	bc := NewFakeBuilder(nil, fakeReg, fakeConfig)
 	alreadyBuilt := []string{"test/test-1"}
-	fakeReg.AddImageByName(alreadyBuilt...)
+	require.NoError(t, fakeReg.AddImageByName(alreadyBuilt...))
 	ctx := context.Background()
 	stack := &model.Stack{
 		Services: map[string]*model.Service{
@@ -81,50 +146,95 @@ func TestServicesNotInStack(t *testing.T) {
 	fakeManifest.Deploy = &model.DeployInfo{ComposeSection: &model.ComposeSectionInfo{
 		Stack: stack,
 	}}
-	toBuild, err := bc.GetServicesToBuild(ctx, fakeManifest, []string{"test-1", "test-2"})
-	//should not throw error
-	assert.NoError(t, err)
-	assert.Equal(t, len(fakeManifest.Build)-len(alreadyBuilt), len(toBuild))
+	toBuildSvcsInput := []string{"test-1"}
+
+	toBuild, err := bc.GetServicesToBuildDuringExecution(ctx, fakeManifest, toBuildSvcsInput)
+	// should not throw error
+	require.NoError(t, err)
+	require.Equal(t, len(toBuildSvcsInput)-len(alreadyBuilt), len(toBuild))
 }
 
 func TestAllServicesAlreadyBuiltWithSubset(t *testing.T) {
-	fakeReg := test.NewFakeOktetoRegistry(nil)
-	bc := &OktetoBuilder{
-		Registry: fakeReg,
+	fakeReg := newFakeRegistry()
+	fakeConfig := fakeConfig{
+		isOkteto: true,
 	}
+	bc := NewFakeBuilder(nil, fakeReg, fakeConfig)
 	alreadyBuilt := []string{}
-	fakeReg.AddImageByName(alreadyBuilt...)
+	require.NoError(t, fakeReg.AddImageByName(alreadyBuilt...))
 	ctx := context.Background()
-	toBuild, err := bc.GetServicesToBuild(ctx, fakeManifest, []string{"test-1"})
-	//should not throw error
-	assert.NoError(t, err)
-	assert.Equal(t, 1, len(toBuild))
+	toBuild, err := bc.GetServicesToBuildDuringExecution(ctx, fakeManifest, []string{"test-1"})
+	// should not throw error
+	require.NoError(t, err)
+	require.Equal(t, 1, len(toBuild))
 }
 
 func TestServicesNotAreAlreadyBuiltWithSubset(t *testing.T) {
-	fakeReg := test.NewFakeOktetoRegistry(nil)
-	bc := &OktetoBuilder{
-		Registry: fakeReg,
+	fakeReg := newFakeRegistry()
+	fakeConfig := fakeConfig{
+		isOkteto: true,
 	}
+	bc := NewFakeBuilder(nil, fakeReg, fakeConfig)
 	alreadyBuilt := []string{"test/test-1"}
-	fakeReg.AddImageByName(alreadyBuilt...)
+	require.NoError(t, fakeReg.AddImageByName(alreadyBuilt...))
 	ctx := context.Background()
-	toBuild, err := bc.GetServicesToBuild(ctx, fakeManifest, []string{"test-1"})
-	//should not throw error
-	assert.NoError(t, err)
-	assert.Equal(t, 0, len(toBuild))
+	toBuild, err := bc.GetServicesToBuildDuringExecution(ctx, fakeManifest, []string{"test-1"})
+	// should not throw error
+	require.NoError(t, err)
+	require.Equal(t, 0, len(toBuild))
+}
+
+func TestServicesBuildSection(t *testing.T) {
+	fakeReg := newFakeRegistry()
+	fakeConfig := fakeConfig{
+		isOkteto: true,
+	}
+	bc := NewFakeBuilder(nil, fakeReg, fakeConfig)
+	alreadyBuilt := []string{}
+	require.NoError(t, fakeReg.AddImageByName(alreadyBuilt...))
+	ctx := context.Background()
+	fakeManifest.Build = map[string]*build.Info{}
+	toBuild, err := bc.GetServicesToBuildDuringExecution(ctx, fakeManifest, []string{})
+	// should not throw error
+	require.NoError(t, err)
+	require.Empty(t, toBuild)
 }
 
 func TestNoServiceBuiltWithSubset(t *testing.T) {
-	fakeReg := test.NewFakeOktetoRegistry(nil)
-	bc := &OktetoBuilder{
-		Registry: fakeReg,
+	fakeReg := newFakeRegistry()
+	fakeConfig := fakeConfig{
+		isOkteto: true,
 	}
+	bc := NewFakeBuilder(nil, fakeReg, fakeConfig)
 	alreadyBuilt := []string{"test/test-1", "test/test-2"}
-	fakeReg.AddImageByName(alreadyBuilt...)
+	require.NoError(t, fakeReg.AddImageByName(alreadyBuilt...))
 	ctx := context.Background()
-	toBuild, err := bc.GetServicesToBuild(ctx, fakeManifest, []string{"test-1"})
-	//should not throw error
-	assert.NoError(t, err)
-	assert.Equal(t, 0, len(toBuild))
+	toBuild, err := bc.GetServicesToBuildDuringExecution(ctx, fakeManifest, []string{"test-1"})
+	// should not throw error
+	require.NoError(t, err)
+	require.Equal(t, 0, len(toBuild))
 }
+
+type fakeConfig struct {
+	sha                 string
+	repoURL             string
+	globalNamespace     string
+	namespace           string
+	registryURL         string
+	isClean             bool
+	hasAccess           bool
+	isOkteto            bool
+	isSmartBuildsEnable bool
+}
+
+func (fc fakeConfig) HasGlobalAccess() bool                  { return fc.hasAccess }
+func (fc fakeConfig) IsCleanProject() bool                   { return fc.isClean }
+func (fc fakeConfig) GetGitCommit() string                   { return fc.sha }
+func (fc fakeConfig) IsOkteto() bool                         { return fc.isOkteto }
+func (fc fakeConfig) IsOktetoCluster() bool                  { return fc.isOkteto }
+func (fc fakeConfig) GetAnonymizedRepo() string              { return fc.repoURL }
+func (fc fakeConfig) GetBuildContextHash(*build.Info) string { return "" }
+func (fc fakeConfig) IsSmartBuildsEnabled() bool             { return fc.isSmartBuildsEnable }
+func (fc fakeConfig) GetGlobalNamespace() string             { return fc.globalNamespace }
+func (fc fakeConfig) GetNamespace() string                   { return fc.namespace }
+func (fc fakeConfig) GetRegistryURL() string                 { return fc.registryURL }

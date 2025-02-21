@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,27 +18,29 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/okteto/okteto/pkg/constants"
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/k8s/deployments"
 	"github.com/okteto/okteto/pkg/k8s/pods"
 	"github.com/okteto/okteto/pkg/k8s/replicasets"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
 	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 type DeploymentApp struct {
-	kind string
 	d    *appsv1.Deployment
+	kind string
 }
 
 func NewDeploymentApp(d *appsv1.Deployment) *DeploymentApp {
-	return &DeploymentApp{kind: model.Deployment, d: d}
+	return &DeploymentApp{kind: okteto.Deployment, d: d}
 }
 
 func (i *DeploymentApp) Kind() string {
@@ -60,7 +62,7 @@ func (i *DeploymentApp) Replicas() int32 {
 }
 
 func (i *DeploymentApp) SetReplicas(n int32) {
-	i.d.Spec.Replicas = pointer.Int32Ptr(n)
+	i.d.Spec.Replicas = ptr.To(n)
 }
 
 func (i *DeploymentApp) TemplateObjectMeta() metav1.ObjectMeta {
@@ -88,7 +90,7 @@ func (i *DeploymentApp) DevClone() App {
 		Spec: *i.d.Spec.DeepCopy(),
 	}
 	if i.d.Annotations[model.OktetoAutoCreateAnnotation] == model.OktetoUpCmd {
-		clone.Labels[model.DevLabel] = "true"
+		clone.Labels[constants.DevLabel] = "true"
 	} else {
 		clone.Labels[model.DevCloneLabel] = string(i.d.UID)
 	}
@@ -125,7 +127,7 @@ func (i *DeploymentApp) RestoreOriginal() error {
 	oktetoLog.Info("deprecated devmodeoff behavior")
 	dOrig := &appsv1.Deployment{}
 	if err := json.Unmarshal([]byte(manifest), dOrig); err != nil {
-		return fmt.Errorf("malformed manifest: %v", err)
+		return fmt.Errorf("malformed manifest: %w", err)
 	}
 	i.d = dOrig
 	return nil
@@ -164,11 +166,10 @@ func (i *DeploymentApp) Watch(ctx context.Context, result chan error, c kubernet
 				}
 				continue
 			}
-			switch e.Type {
-			case watch.Deleted:
+			if e.Type == watch.Deleted {
 				result <- oktetoErrors.ErrDeleteToApp
 				return
-			case watch.Modified:
+			} else if e.Type == watch.Modified {
 				d, ok := e.Object.(*appsv1.Deployment)
 				if !ok {
 					oktetoLog.Debugf("Failed to parse deployment event: %s", e)
@@ -204,4 +205,14 @@ func (i *DeploymentApp) Destroy(ctx context.Context, c kubernetes.Interface) err
 
 func (i *DeploymentApp) PatchAnnotations(ctx context.Context, c kubernetes.Interface) error {
 	return deployments.PatchAnnotations(ctx, i.d, c)
+}
+
+// GetDevClone Returns from Kubernetes the cloned deployment
+func (i *DeploymentApp) GetDevClone(ctx context.Context, c kubernetes.Interface) (App, error) {
+	clonedName := model.DevCloneName(i.d.Name)
+	d, err := deployments.Get(ctx, clonedName, i.d.Namespace, c)
+	if err == nil {
+		return NewDeploymentApp(d), nil
+	}
+	return nil, err
 }

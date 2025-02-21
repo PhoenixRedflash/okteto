@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,12 +18,18 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/kballard/go-shellquote"
+	"github.com/okteto/okteto/pkg/build"
+	"github.com/okteto/okteto/pkg/cache"
+	"github.com/okteto/okteto/pkg/env"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/filesystem"
+	"github.com/okteto/okteto/pkg/model/forward"
 	apiv1 "k8s.io/api/core/v1"
 	resource "k8s.io/apimachinery/pkg/api/resource"
 )
@@ -32,12 +38,10 @@ const (
 	DefaultReplicasNumber = 1
 )
 
-//Stack represents an okteto stack
+// StackRaw represents an okteto stack
 type StackRaw struct {
 	Version   string                     `yaml:"version,omitempty"`
 	Name      string                     `yaml:"name"`
-	Namespace string                     `yaml:"namespace,omitempty"`
-	Context   string                     `yaml:"context,omitempty"`
 	Services  map[string]*ServiceRaw     `yaml:"services,omitempty"`
 	Endpoints EndpointSpec               `yaml:"endpoints,omitempty"`
 	Volumes   map[string]*VolumeTopLevel `yaml:"volumes,omitempty"`
@@ -54,107 +58,103 @@ type StackRaw struct {
 	Warnings StackWarnings
 }
 
-//Service represents an okteto stack service
+// ServiceRaw represents an okteto stack service
 type ServiceRaw struct {
-	Deploy                   *DeployInfoRaw        `yaml:"deploy,omitempty"`
-	Build                    *BuildInfo            `yaml:"build,omitempty"`
-	CapAddSneakCase          []apiv1.Capability    `yaml:"cap_add,omitempty"`
-	CapAdd                   []apiv1.Capability    `yaml:"capAdd,omitempty"`
-	CapDropSneakCase         []apiv1.Capability    `yaml:"cap_drop,omitempty"`
-	CapDrop                  []apiv1.Capability    `yaml:"capDrop,omitempty"`
-	Command                  CommandStack          `yaml:"command,omitempty"`
-	CpuCount                 Quantity              `yaml:"cpu_count,omitempty"`
-	Cpus                     Quantity              `yaml:"cpus,omitempty"`
-	Entrypoint               CommandStack          `yaml:"entrypoint,omitempty"`
-	Args                     ArgsStack             `yaml:"args,omitempty"`
-	EnvFilesSneakCase        EnvFiles              `yaml:"env_file,omitempty"`
-	EnvFiles                 EnvFiles              `yaml:"envFile,omitempty"`
-	Environment              Environment           `yaml:"environment,omitempty"`
-	Expose                   []PortRaw             `yaml:"expose,omitempty"`
-	Healthcheck              *HealthCheck          `yaml:"healthcheck,omitempty"`
-	Image                    string                `yaml:"image,omitempty"`
-	Labels                   Labels                `json:"labels,omitempty" yaml:"labels,omitempty"`
-	Annotations              Annotations           `json:"annotations,omitempty" yaml:"annotations,omitempty"`
-	MemLimit                 Quantity              `yaml:"mem_limit,omitempty"`
-	MemReservation           Quantity              `yaml:"mem_reservation,omitempty"`
-	Ports                    []PortRaw             `yaml:"ports,omitempty"`
-	Restart                  string                `yaml:"restart,omitempty"`
-	Scale                    *int32                `yaml:"scale"`
-	StopGracePeriodSneakCase *RawMessage           `yaml:"stop_grace_period,omitempty"`
-	StopGracePeriod          *RawMessage           `yaml:"stopGracePeriod,omitempty"`
-	User                     *StackSecurityContext `yaml:"user,omitempty"`
-	Volumes                  []StackVolume         `yaml:"volumes,omitempty"`
-	WorkingDirSneakCase      string                `yaml:"working_dir,omitempty"`
-	Workdir                  string                `yaml:"workdir,omitempty"`
-	DependsOn                DependsOn             `yaml:"depends_on,omitempty"`
-
-	Public    bool            `yaml:"public,omitempty"`
-	Replicas  *int32          `yaml:"replicas"`
-	Resources *StackResources `yaml:"resources,omitempty"`
-
-	BlkioConfig       *WarningType `yaml:"blkio_config,omitempty"`
-	CpuPercent        *WarningType `yaml:"cpu_percent,omitempty"`
-	CpuShares         *WarningType `yaml:"cpu_shares,omitempty"`
-	CpuPeriod         *WarningType `yaml:"cpu_period,omitempty"`
-	CpuQuota          *WarningType `yaml:"cpu_quota,omitempty"`
-	CpuRtRuntime      *WarningType `yaml:"cpu_rt_runtime,omitempty"`
-	CpuRtPeriod       *WarningType `yaml:"cpu_rt_period,omitempty"`
-	Cpuset            *WarningType `yaml:"cpuset,omitempty"`
-	CgroupParent      *WarningType `yaml:"cgroup_parent,omitempty"`
-	Configs           *WarningType `yaml:"configs,omitempty"`
-	ContainerName     *WarningType `yaml:"container_name,omitempty"`
-	CredentialSpec    *WarningType `yaml:"credential_spec,omitempty"`
-	DeviceCgroupRules *WarningType `yaml:"device_cgroup_rules,omitempty"`
-	Devices           *WarningType `yaml:"devices,omitempty"`
-	Dns               *WarningType `yaml:"dns,omitempty"`
-	DnsOpt            *WarningType `yaml:"dns_opt,omitempty"`
-	DnsSearch         *WarningType `yaml:"dns_search,omitempty"`
-	DomainName        *WarningType `yaml:"domainname,omitempty"`
-	Extends           *WarningType `yaml:"extends,omitempty"`
-	ExternalLinks     *WarningType `yaml:"external_links,omitempty"`
-	ExtraHosts        *WarningType `yaml:"extra_hosts,omitempty"`
-	GroupAdd          *WarningType `yaml:"group_add,omitempty"`
-	Hostname          *WarningType `yaml:"hostname,omitempty"`
-	Init              *WarningType `yaml:"init,omitempty"`
-	Ipc               *WarningType `yaml:"ipc,omitempty"`
-	Isolation         *WarningType `yaml:"isolation,omitempty"`
-	Links             *WarningType `yaml:"links,omitempty"`
-	Logging           *WarningType `yaml:"logging,omitempty"`
-	Network_mode      *WarningType `yaml:"network_mode,omitempty"`
-	Networks          *WarningType `yaml:"networks,omitempty"`
-	MacAddress        *WarningType `yaml:"mac_address,omitempty"`
-	MemSwappiness     *WarningType `yaml:"mem_swappiness,omitempty"`
-	MemswapLimit      *WarningType `yaml:"memswap_limit,omitempty"`
-	OomKillDisable    *WarningType `yaml:"oom_kill_disable,omitempty"`
-	OomScoreAdj       *WarningType `yaml:"oom_score_adj,omitempty"`
-	Pid               *WarningType `yaml:"pid,omitempty"`
-	PidLimit          *WarningType `yaml:"pid_limit,omitempty"`
-	Platform          *WarningType `yaml:"platform,omitempty"`
-	Privileged        *WarningType `yaml:"privileged,omitempty"`
-	Profiles          *WarningType `yaml:"profiles,omitempty"`
-	PullPolicy        *WarningType `yaml:"pull_policy,omitempty"`
-	ReadOnly          *WarningType `yaml:"read_only,omitempty"`
-	Runtime           *WarningType `yaml:"runtime,omitempty"`
-	Secrets           *WarningType `yaml:"secrets,omitempty"`
-	SecurityOpt       *WarningType `yaml:"security_opt,omitempty"`
-	ShmSize           *WarningType `yaml:"shm_size,omitempty"`
-	StdinOpen         *WarningType `yaml:"stdin_open,omitempty"`
-	StopSignal        *WarningType `yaml:"stop_signal,omitempty"`
-	StorageOpts       *WarningType `yaml:"storage_opts,omitempty"`
-	Sysctls           *WarningType `yaml:"sysctls,omitempty"`
-	Tmpfs             *WarningType `yaml:"tmpfs,omitempty"`
-	Tty               *WarningType `yaml:"tty,omitempty"`
-	Ulimits           *WarningType `yaml:"ulimits,omitempty"`
-	UsernsMode        *WarningType `yaml:"userns_mode,omitempty"`
-	VolumesFrom       *WarningType `yaml:"volumes_from,omitempty"`
-
-	// Extensions
-	Extensions map[string]interface{} `yaml:",inline" json:"-"`
+	MemSwappiness            *WarningType           `yaml:"mem_swappiness,omitempty"`
+	CredentialSpec           *WarningType           `yaml:"credential_spec,omitempty"`
+	Extensions               map[string]interface{} `yaml:",inline" json:"-"`
+	VolumesFrom              *WarningType           `yaml:"volumes_from,omitempty"`
+	UsernsMode               *WarningType           `yaml:"userns_mode,omitempty"`
+	Ulimits                  *WarningType           `yaml:"ulimits,omitempty"`
+	Tty                      *WarningType           `yaml:"tty,omitempty"`
+	Tmpfs                    *WarningType           `yaml:"tmpfs,omitempty"`
+	Sysctls                  *WarningType           `yaml:"sysctls,omitempty"`
+	StorageOpts              *WarningType           `yaml:"storage_opts,omitempty"`
+	StopSignal               *WarningType           `yaml:"stop_signal,omitempty"`
+	StdinOpen                *WarningType           `yaml:"stdin_open,omitempty"`
+	ShmSize                  *WarningType           `yaml:"shm_size,omitempty"`
+	SecurityOpt              *WarningType           `yaml:"security_opt,omitempty"`
+	Secrets                  *WarningType           `yaml:"secrets,omitempty"`
+	Healthcheck              *HealthCheck           `yaml:"healthcheck,omitempty"`
+	Runtime                  *WarningType           `yaml:"runtime,omitempty"`
+	Labels                   Labels                 `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Annotations              Annotations            `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	NodeSelector             Selector               `json:"x-node-selector,omitempty" yaml:"x-node-selector,omitempty"`
+	ReadOnly                 *WarningType           `yaml:"read_only,omitempty"`
+	PullPolicy               *WarningType           `yaml:"pull_policy,omitempty"`
+	ContainerName            *WarningType           `yaml:"container_name,omitempty"`
+	Profiles                 *WarningType           `yaml:"profiles,omitempty"`
+	Scale                    *int32                 `yaml:"scale"`
+	StopGracePeriodSneakCase *RawMessage            `yaml:"stop_grace_period,omitempty"`
+	StopGracePeriod          *RawMessage            `yaml:"stopGracePeriod,omitempty"`
+	User                     *StackSecurityContext  `yaml:"user,omitempty"`
+	Privileged               *WarningType           `yaml:"privileged,omitempty"`
+	Platform                 *WarningType           `yaml:"platform,omitempty"`
+	PidLimit                 *WarningType           `yaml:"pid_limit,omitempty"`
+	DependsOn                DependsOn              `yaml:"depends_on,omitempty"`
+	Pid                      *WarningType           `yaml:"pid,omitempty"`
+	Replicas                 *int32                 `yaml:"replicas"`
+	Resources                *StackResources        `yaml:"resources,omitempty"`
+	BlkioConfig              *WarningType           `yaml:"blkio_config,omitempty"`
+	CpuPercent               *WarningType           `yaml:"cpu_percent,omitempty"`
+	CpuShares                *WarningType           `yaml:"cpu_shares,omitempty"`
+	CpuPeriod                *WarningType           `yaml:"cpu_period,omitempty"`
+	CpuQuota                 *WarningType           `yaml:"cpu_quota,omitempty"`
+	CpuRtRuntime             *WarningType           `yaml:"cpu_rt_runtime,omitempty"`
+	CpuRtPeriod              *WarningType           `yaml:"cpu_rt_period,omitempty"`
+	Cpuset                   *WarningType           `yaml:"cpuset,omitempty"`
+	CgroupParent             *WarningType           `yaml:"cgroup_parent,omitempty"`
+	Networks                 *WarningType           `yaml:"networks,omitempty"`
+	Build                    *composeBuildInfo      `yaml:"build,omitempty"`
+	OomScoreAdj              *WarningType           `yaml:"oom_score_adj,omitempty"`
+	DeviceCgroupRules        *WarningType           `yaml:"device_cgroup_rules,omitempty"`
+	Devices                  *WarningType           `yaml:"devices,omitempty"`
+	Dns                      *WarningType           `yaml:"dns,omitempty"`
+	DnsOpt                   *WarningType           `yaml:"dns_opt,omitempty"`
+	DnsSearch                *WarningType           `yaml:"dns_search,omitempty"`
+	DomainName               *WarningType           `yaml:"domainname,omitempty"`
+	Extends                  *WarningType           `yaml:"extends,omitempty"`
+	ExternalLinks            *WarningType           `yaml:"external_links,omitempty"`
+	ExtraHosts               *WarningType           `yaml:"extra_hosts,omitempty"`
+	GroupAdd                 *WarningType           `yaml:"group_add,omitempty"`
+	Hostname                 *WarningType           `yaml:"hostname,omitempty"`
+	Init                     *WarningType           `yaml:"init,omitempty"`
+	Ipc                      *WarningType           `yaml:"ipc,omitempty"`
+	Isolation                *WarningType           `yaml:"isolation,omitempty"`
+	Links                    *WarningType           `yaml:"links,omitempty"`
+	Logging                  *WarningType           `yaml:"logging,omitempty"`
+	Network_mode             *WarningType           `yaml:"network_mode,omitempty"`
+	Configs                  *WarningType           `yaml:"configs,omitempty"`
+	MacAddress               *WarningType           `yaml:"mac_address,omitempty"`
+	Deploy                   *DeployInfoRaw         `yaml:"deploy,omitempty"`
+	MemswapLimit             *WarningType           `yaml:"memswap_limit,omitempty"`
+	OomKillDisable           *WarningType           `yaml:"oom_kill_disable,omitempty"`
+	MemReservation           Quantity               `yaml:"mem_reservation,omitempty"`
+	CpuCount                 Quantity               `yaml:"cpu_count,omitempty"`
+	Cpus                     Quantity               `yaml:"cpus,omitempty"`
+	MemLimit                 Quantity               `yaml:"mem_limit,omitempty"`
+	Restart                  string                 `yaml:"restart,omitempty"`
+	Image                    string                 `yaml:"image,omitempty"`
+	Workdir                  string                 `yaml:"workdir,omitempty"`
+	WorkingDirSneakCase      string                 `yaml:"working_dir,omitempty"`
+	Command                  CommandStack           `yaml:"command,omitempty"`
+	Volumes                  []build.VolumeMounts   `yaml:"volumes,omitempty"`
+	CapAddSneakCase          []apiv1.Capability     `yaml:"cap_add,omitempty"`
+	EnvFiles                 env.Files              `yaml:"envFile,omitempty"`
+	EnvFilesSneakCase        env.Files              `yaml:"env_file,omitempty"`
+	Args                     ArgsStack              `yaml:"args,omitempty"`
+	Entrypoint               CommandStack           `yaml:"entrypoint,omitempty"`
+	Environment              env.Environment        `yaml:"environment,omitempty"`
+	Expose                   []PortRaw              `yaml:"expose,omitempty"`
+	Ports                    []PortRaw              `yaml:"ports,omitempty"`
+	CapDrop                  []apiv1.Capability     `yaml:"capDrop,omitempty"`
+	CapDropSneakCase         []apiv1.Capability     `yaml:"cap_drop,omitempty"`
+	CapAdd                   []apiv1.Capability     `yaml:"capAdd,omitempty"`
+	Public                   bool                   `yaml:"public,omitempty"`
 }
 
 type DeployInfoRaw struct {
 	Replicas      *int32            `yaml:"replicas,omitempty"`
-	Resources     ResourcesRaw      `yaml:"resources,omitempty"`
 	Labels        Labels            `yaml:"labels,omitempty"`
 	RestartPolicy *RestartPolicyRaw `yaml:"restart_policy,omitempty"`
 
@@ -166,32 +166,28 @@ type DeployInfoRaw struct {
 	RollbackConfig *WarningType `yaml:"rollback_config,omitempty"`
 	UpdateConfig   *WarningType `yaml:"update_config,omitempty"`
 
-	// Extensions
 	Extensions map[string]interface{} `yaml:",inline" json:"-"`
+
+	Resources ResourcesRaw `yaml:"resources,omitempty"`
 }
 
 type RestartPolicyRaw struct {
-	Condition   string `yaml:"condition,omitempty"`
-	MaxAttempts int32  `yaml:"max_attempts,omitempty"`
-
-	Delay  *WarningType `yaml:"delay,omitempty"`
-	Window *WarningType `yaml:"window,omitempty"`
-
-	// Extensions
-	Extensions map[string]interface{} `yaml:",inline" json:"-"`
+	Delay       *WarningType           `yaml:"delay,omitempty"`
+	Window      *WarningType           `yaml:"window,omitempty"`
+	Extensions  map[string]interface{} `yaml:",inline" json:"-"`
+	Condition   string                 `yaml:"condition,omitempty"`
+	MaxAttempts int32                  `yaml:"max_attempts,omitempty"`
 }
 
 type PortRaw struct {
+	Extensions    map[string]interface{} `yaml:",inline" json:"-"`
+	Protocol      apiv1.Protocol
 	ContainerPort int32
 	HostPort      int32
 	ContainerFrom int32
 	ContainerTo   int32
 	HostFrom      int32
 	HostTo        int32
-	Protocol      apiv1.Protocol
-
-	// Extensions
-	Extensions map[string]interface{} `yaml:",inline" json:"-"`
 }
 
 type WarningType struct {
@@ -199,38 +195,76 @@ type WarningType struct {
 }
 
 type ResourcesRaw struct {
+	Extensions   map[string]interface{} `yaml:",inline" json:"-"`
 	Limits       DeployComposeResources `json:"limits,omitempty" yaml:"limits,omitempty"`
 	Reservations DeployComposeResources `json:"reservations,omitempty" yaml:"reservations,omitempty"`
-
-	// Extensions
-	Extensions map[string]interface{} `yaml:",inline" json:"-"`
 }
 
 type DeployComposeResources struct {
-	Cpus    Quantity     `json:"cpus,omitempty" yaml:"cpus,omitempty"`
-	Memory  Quantity     `json:"memory,omitempty" yaml:"memory,omitempty"`
-	Devices *WarningType `json:"devices,omitempty" yaml:"devices,omitempty"`
-
-	// Extensions
+	Devices    *WarningType           `json:"devices,omitempty" yaml:"devices,omitempty"`
 	Extensions map[string]interface{} `yaml:",inline" json:"-"`
+	Cpus       Quantity               `json:"cpus,omitempty" yaml:"cpus,omitempty"`
+	Memory     Quantity               `json:"memory,omitempty" yaml:"memory,omitempty"`
 }
 
 type VolumeTopLevel struct {
-	Labels      Labels            `json:"labels,omitempty" yaml:"labels,omitempty"`
-	Annotations Annotations       `json:"annotations,omitempty" yaml:"annotations,omitempty"`
-	Name        string            `json:"name,omitempty" yaml:"name,omitempty"`
-	Size        Quantity          `json:"size,omitempty" yaml:"size,omitempty"`
-	Class       string            `json:"class,omitempty" yaml:"class,omitempty"`
-	DriverOpts  map[string]string `json:"driver_opts,omitempty" yaml:"driver_opts,omitempty"`
-
-	Driver   *WarningType `json:"driver,omitempty" yaml:"driver,omitempty"`
-	External *WarningType `json:"external,omitempty" yaml:"external,omitempty"`
-
-	// Extensions
-	Extensions map[string]interface{} `yaml:",inline" json:"-"`
+	Labels      Labels                 `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Annotations Annotations            `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	DriverOpts  map[string]string      `json:"driver_opts,omitempty" yaml:"driver_opts,omitempty"`
+	Driver      *WarningType           `json:"driver,omitempty" yaml:"driver,omitempty"`
+	External    *WarningType           `json:"external,omitempty" yaml:"external,omitempty"`
+	Extensions  map[string]interface{} `yaml:",inline" json:"-"`
+	Size        Quantity               `json:"size,omitempty" yaml:"size,omitempty"`
+	Name        string                 `json:"name,omitempty" yaml:"name,omitempty"`
+	Class       string                 `json:"class,omitempty" yaml:"class,omitempty"`
 }
 type RawMessage struct {
 	unmarshal func(interface{}) error
+}
+
+type composeBuildInfo struct {
+	Context          string               `yaml:"context,omitempty"`
+	Dockerfile       string               `yaml:"dockerfile,omitempty"`
+	CacheFrom        cache.From           `yaml:"cache_from,omitempty"`
+	Target           string               `yaml:"target,omitempty"`
+	Args             build.Args           `yaml:"args,omitempty"`
+	Image            string               `yaml:"image,omitempty"`
+	VolumesToInclude []build.VolumeMounts `yaml:"-"`
+	ExportCache      cache.ExportCache    `yaml:"export_cache,omitempty"`
+}
+
+func (c *composeBuildInfo) toBuildInfo() *build.Info {
+	if c == nil {
+		return nil
+	}
+	return &build.Info{
+		Context:          c.Context,
+		Dockerfile:       c.Dockerfile,
+		CacheFrom:        c.CacheFrom,
+		Target:           c.Target,
+		Args:             c.Args,
+		Image:            c.Image,
+		VolumesToInclude: c.VolumesToInclude,
+		ExportCache:      c.ExportCache,
+	}
+}
+
+func (c *composeBuildInfo) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var rawString string
+	err := unmarshal(&rawString)
+	if err == nil {
+		c.Context = rawString
+		return nil
+	}
+
+	type composeBuildInfoExtended composeBuildInfo // prevent recursion
+	var rawBuildInfo *composeBuildInfoExtended
+	err = unmarshal(&rawBuildInfo)
+	if err != nil {
+		return err
+	}
+	*c = composeBuildInfo(*rawBuildInfo)
+	return nil
 }
 
 func (s *Stack) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -245,14 +279,11 @@ func (s *Stack) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	}
 	s.Name = stackRaw.Name
 
-	s.Namespace = stackRaw.Namespace
-	s.Context = stackRaw.Context
-
 	s.Endpoints = stackRaw.Endpoints
 
 	s.Volumes = make(map[string]*VolumeSpec)
 	for volumeName, volume := range stackRaw.Volumes {
-		volumeSpec, err := unmarshalVolume(volume)
+		volumeSpec, err := unmarshalVolume(volume, s.IsCompose)
 		if err != nil {
 			return err
 		}
@@ -279,70 +310,55 @@ func (s *Stack) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-func unmarshalVolume(volume *VolumeTopLevel) (*VolumeSpec, error) {
+func unmarshalVolume(volume *VolumeTopLevel, isCompose bool) (*VolumeSpec, error) {
+	result := &VolumeSpec{
+		Labels:      make(Labels),
+		Annotations: make(Annotations),
+	}
 
-	result := &VolumeSpec{}
 	if volume == nil {
-		result.Labels = make(Labels)
-		result.Annotations = make(Annotations)
-	} else {
-		result.Labels = make(Labels)
-		if volume.Annotations == nil {
-			result.Annotations = make(Annotations)
-		} else {
-			result.Annotations = volume.Annotations
-		}
+		return result, nil
+	}
 
+	if isCompose {
+		for key, value := range volume.Annotations {
+			result.Labels[key] = value
+		}
 		for key, value := range volume.Labels {
 			result.Annotations[key] = value
 		}
-
-		if volume.Size.Value.Cmp(resource.MustParse("0")) > 0 {
-			result.Size = volume.Size
+	} else { // stack
+		for key, value := range volume.Annotations {
+			result.Annotations[key] = value
 		}
-		if volume.DriverOpts != nil {
-			for key, value := range volume.DriverOpts {
-				if key == "size" {
-					qK8s, err := resource.ParseQuantity(value)
-					if err != nil {
-						return nil, err
-					}
-					result.Size.Value = qK8s
+		for key, value := range volume.Labels {
+			result.Annotations[key] = value
+		}
+	}
+
+	if volume.Size.Value.Cmp(resource.MustParse("0")) > 0 {
+		result.Size = volume.Size
+	}
+	if volume.DriverOpts != nil {
+		for key, value := range volume.DriverOpts {
+			if key == "size" {
+				qK8s, err := resource.ParseQuantity(value)
+				if err != nil {
+					return nil, err
 				}
-				if key == "class" {
-					result.Class = value
-				}
+				result.Size.Value = qK8s
+			}
+			if key == "class" {
+				result.Class = value
 			}
 		}
-		if result.Class == "" {
-			result.Class = volume.Class
-		}
+	}
+	if result.Class == "" {
+		result.Class = volume.Class
 	}
 
 	return result, nil
 
-}
-
-func getEndpointsFromPorts(services map[string]*ServiceRaw) EndpointSpec {
-	endpoints := make(EndpointSpec)
-	for svcName, svc := range services {
-		accessiblePorts := getAccessiblePorts(svc.Ports)
-		if len(accessiblePorts) >= 2 {
-			for _, p := range accessiblePorts {
-				endpointName := fmt.Sprintf("%s-%d", svcName, p.HostPort)
-				endpoints[endpointName] = Endpoint{
-					Rules: []EndpointRule{
-						{
-							Path:    "/",
-							Service: svcName,
-							Port:    p.ContainerPort,
-						},
-					},
-				}
-			}
-		}
-	}
-	return endpoints
 }
 
 func getAccessiblePorts(ports []PortRaw) []PortRaw {
@@ -359,16 +375,12 @@ func (serviceRaw *ServiceRaw) ToService(svcName string, stack *Stack) (*Service,
 	svc := &Service{}
 	var err error
 
-	svc.Resources, err = unmarshalDeployResources(serviceRaw.Deploy, serviceRaw.Resources, serviceRaw.CpuCount, serviceRaw.Cpus, serviceRaw.MemLimit, serviceRaw.MemReservation)
-	if err != nil {
-		return nil, err
-	}
-	svc.Replicas, err = unmarshalDeployReplicas(serviceRaw.Deploy, serviceRaw.Scale, serviceRaw.Replicas)
-	if err != nil {
-		return nil, err
-	}
+	svc.Resources = unmarshalDeployResources(serviceRaw.Deploy, serviceRaw.Resources, serviceRaw.CpuCount, serviceRaw.Cpus, serviceRaw.MemLimit, serviceRaw.MemReservation)
+
+	svc.Replicas = unmarshalDeployReplicas(serviceRaw.Deploy, serviceRaw.Scale, serviceRaw.Replicas)
+
 	svc.Image = serviceRaw.Image
-	svc.Build = serviceRaw.Build
+	svc.Build = serviceRaw.Build.toBuildInfo()
 
 	svc.CapAdd = serviceRaw.CapAdd
 	if len(serviceRaw.CapAddSneakCase) > 0 {
@@ -387,14 +399,18 @@ func (serviceRaw *ServiceRaw) ToService(svcName string, stack *Stack) (*Service,
 		translateHealtcheckCurlToHTTP(svc.Healtcheck)
 	}
 
-	svc.Annotations = serviceRaw.Annotations
+	svc.NodeSelector = serviceRaw.NodeSelector
+
+	if svc.Labels == nil {
+		svc.Labels = make(Labels)
+	}
 	if svc.Annotations == nil {
 		svc.Annotations = make(Annotations)
 	}
 
 	if stack.IsCompose {
 		if len(serviceRaw.Args.Values) > 0 {
-			return nil, fmt.Errorf("Unsupported field for services.%s: 'args'", svcName)
+			return nil, fmt.Errorf("unsupported field for services.%s: 'args'", svcName)
 		}
 		svc.Entrypoint.Values = serviceRaw.Entrypoint.Values
 		svc.Command.Values = serviceRaw.Command.Values
@@ -402,10 +418,12 @@ func (serviceRaw *ServiceRaw) ToService(svcName string, stack *Stack) (*Service,
 		for key, value := range unmarshalLabels(serviceRaw.Labels, serviceRaw.Deploy) {
 			svc.Annotations[key] = value
 		}
-
+		for key, value := range serviceRaw.Annotations {
+			svc.Labels[key] = value
+		}
 	} else { // isOktetoStack
 		if len(serviceRaw.Entrypoint.Values) > 0 {
-			return nil, fmt.Errorf("Unsupported field for services.%s: 'entrypoint'", svcName)
+			return nil, fmt.Errorf("unsupported field for services.%s: 'entrypoint'", svcName)
 		}
 		svc.Entrypoint.Values = serviceRaw.Command.Values
 		if len(serviceRaw.Command.Values) == 1 {
@@ -415,12 +433,10 @@ func (serviceRaw *ServiceRaw) ToService(svcName string, stack *Stack) (*Service,
 		}
 		svc.Command.Values = serviceRaw.Args.Values
 
-		if svc.Labels == nil {
-			svc.Labels = make(Labels)
-		}
 		for key, value := range unmarshalLabels(serviceRaw.Labels, serviceRaw.Deploy) {
 			svc.Labels[key] = value
 		}
+		svc.Annotations = serviceRaw.Annotations
 	}
 
 	svc.EnvFiles = serviceRaw.EnvFiles
@@ -428,7 +444,7 @@ func (serviceRaw *ServiceRaw) ToService(svcName string, stack *Stack) (*Service,
 		svc.EnvFiles = serviceRaw.EnvFilesSneakCase
 	}
 
-	svc.Environment = Environment{}
+	svc.Environment = env.Environment{}
 	for _, env := range serviceRaw.Environment {
 		if env.Value == "" {
 			env.Value = os.Getenv(env.Name)
@@ -489,6 +505,51 @@ func (serviceRaw *ServiceRaw) ToService(svcName string, stack *Stack) (*Service,
 	return svc, nil
 }
 
+type healthCheckunmarshaller struct {
+	HTTP        *HTTPHealtcheck `yaml:"http,omitempty"`
+	Readiness   *bool           `yaml:"x-okteto-readiness,omitempty"`
+	Test        HealtcheckTest  `yaml:"test,omitempty"`
+	Interval    time.Duration   `yaml:"interval,omitempty"`
+	Timeout     time.Duration   `yaml:"timeout,omitempty"`
+	StartPeriod time.Duration   `yaml:"start_period,omitempty"`
+	Retries     int             `yaml:"retries,omitempty"`
+	Disable     bool            `yaml:"disable,omitempty"`
+	Liveness    bool            `yaml:"x-okteto-liveness,omitempty"`
+}
+
+// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
+func (hc *HealthCheck) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var rawHealthcheck healthCheckunmarshaller
+	err := unmarshal(&rawHealthcheck)
+	if err != nil {
+		return fmt.Errorf("error reading healthchecks: %w", err)
+	}
+
+	var readiness bool
+	if rawHealthcheck.Readiness == nil {
+		readiness = true
+	} else {
+		readiness = *rawHealthcheck.Readiness
+	}
+
+	if !rawHealthcheck.Liveness && !readiness {
+		return fmt.Errorf("error reading healthchecks: 'x-okteto-liveness' or 'x-okteto-readiness' must be true")
+	}
+
+	*hc = HealthCheck{
+		HTTP:        rawHealthcheck.HTTP,
+		Test:        rawHealthcheck.Test,
+		Interval:    rawHealthcheck.Interval,
+		Timeout:     rawHealthcheck.Timeout,
+		Retries:     rawHealthcheck.Retries,
+		StartPeriod: rawHealthcheck.StartPeriod,
+		Disable:     rawHealthcheck.Disable,
+		Liveness:    rawHealthcheck.Liveness,
+		Readiness:   readiness,
+	}
+	return nil
+}
+
 func validateHealthcheck(healthcheck *HealthCheck) error {
 	if healthcheck != nil && len(healthcheck.Test) != 0 && healthcheck.Test[0] == "NONE" {
 		healthcheck.Test = make(HealtcheckTest, 0)
@@ -510,8 +571,9 @@ func translateHealtcheckCurlToHTTP(healthcheck *HealthCheck) {
 	s := strings.Join(healthcheck.Test, " ")
 	testStrings := strings.Split(s, " ")
 
+	minTestStrings := 2
 	// There should be at least two strings, the curl binary and url.
-	if len(testStrings) < 2 {
+	if len(testStrings) < minTestStrings {
 		return
 	}
 
@@ -547,7 +609,7 @@ func translateHealtcheckCurlToHTTP(healthcheck *HealthCheck) {
 	if p == "" {
 		return
 	}
-	port, err := strconv.Atoi(p)
+	port, err := strconv.ParseInt(p, 10, 32)
 	if err != nil {
 		return
 	}
@@ -610,6 +672,7 @@ func getSvcPorts(public bool, rawPorts, rawExpose []PortRaw) (bool, []Port, erro
 // ports:         | ports:
 //   - 5000       |   - 5000:5000
 //   - 3000       |   - 3000:3000
+//
 // public: true   |
 func translateOktetoStacksPortsIntoComposeSyntax(ports []PortRaw) []PortRaw {
 	for idx, p := range ports {
@@ -651,20 +714,20 @@ func expandRangePorts(ports []PortRaw) []PortRaw {
 func validatePort(newPort PortRaw, ports []Port) error {
 	for _, p := range ports {
 		if newPort.ContainerPort == p.HostPort {
-			return fmt.Errorf("Container port '%d' is already declared as host port in port '%d:%d'", newPort.ContainerPort, p.HostPort, p.ContainerPort)
+			return fmt.Errorf("container port '%d' is already declared as host port in port '%d:%d'", newPort.ContainerPort, p.HostPort, p.ContainerPort)
 		}
 		if newPort.HostPort == p.ContainerPort {
 			if p.HostPort == 0 {
-				return fmt.Errorf("Host port '%d' is already declared as container port in port '%d'", newPort.HostPort, p.ContainerPort)
+				return fmt.Errorf("host port '%d' is already declared as container port in port '%d'", newPort.HostPort, p.ContainerPort)
 			} else {
-				return fmt.Errorf("Host port '%d' is already declared as container port in port '%d:%d'", newPort.HostPort, p.HostPort, p.ContainerPort)
+				return fmt.Errorf("host port '%d' is already declared as container port in port '%d:%d'", newPort.HostPort, p.HostPort, p.ContainerPort)
 			}
 		}
 	}
 	return nil
 }
 
-func isNamedVolumeDeclared(volume StackVolume) bool {
+func isNamedVolumeDeclared(volume build.VolumeMounts) bool {
 	if volume.LocalPath != "" {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -682,16 +745,16 @@ func isNamedVolumeDeclared(volume StackVolume) bool {
 		if strings.HasPrefix(volume.LocalPath, "./") && relative {
 			return true
 		}
-		if FileExists(volume.LocalPath) && relative {
+		if filesystem.FileExists(volume.LocalPath) && relative {
 			return true
 		}
 	}
 	return false
 }
 
-func splitVolumesByType(volumes []StackVolume, s *Stack) ([]StackVolume, []StackVolume) {
-	topLevelVolumes := make([]StackVolume, 0)
-	mountedVolumes := make([]StackVolume, 0)
+func splitVolumesByType(volumes []build.VolumeMounts, s *Stack) ([]build.VolumeMounts, []build.VolumeMounts) {
+	topLevelVolumes := make([]build.VolumeMounts, 0)
+	mountedVolumes := make([]build.VolumeMounts, 0)
 	for _, volume := range volumes {
 		if volume.LocalPath == "" || isInVolumesTopLevelSection(sanitizeName(volume.LocalPath), s) {
 			volume.LocalPath = sanitizeName(volume.LocalPath)
@@ -742,24 +805,25 @@ func (sc *StackSecurityContext) UnmarshalYAML(unmarshal func(interface{}) error)
 	err := unmarshal(&rawSecurityContext)
 	if err == nil {
 		if strings.Contains(rawSecurityContext, ":") {
+			securityContextLength := 2
 			parts := strings.Split(rawSecurityContext, ":")
-			if len(parts) != 2 {
-				return fmt.Errorf("SecurityContext '%s' is malformed. Only 'dddd:dddd' is supported", rawSecurityContext)
+			if len(parts) != securityContextLength {
+				return fmt.Errorf("securityContext '%s' is malformed. Only 'dddd:dddd' is supported", rawSecurityContext)
 			}
 			runAsUser, err := strconv.ParseInt(parts[0], 10, 64)
 			if err != nil {
-				return fmt.Errorf("Can not obtain UID from '%s'", parts[0])
+				return fmt.Errorf("cannot obtain UID from '%s'", parts[0])
 			}
 			runAsGroup, err := strconv.ParseInt(parts[1], 10, 64)
 			if err != nil {
-				return fmt.Errorf("Can not obtain GID from '%s'", parts[1])
+				return fmt.Errorf("cannot obtain GID from '%s'", parts[1])
 			}
 			sc.RunAsUser = &runAsUser
 			sc.RunAsGroup = &runAsGroup
 		} else {
 			runAsUser, err := strconv.ParseInt(rawSecurityContext, 10, 64)
 			if err != nil {
-				return fmt.Errorf("Can not obtain UID from '%s'", rawSecurityContext)
+				return fmt.Errorf("cannot obtain UID from '%s'", rawSecurityContext)
 			}
 			sc.RunAsUser = &runAsUser
 		}
@@ -848,9 +912,10 @@ func getPortWithoutMapping(p *PortRaw, portString string) error {
 
 func getRangePorts(portString string) (int32, int32, apiv1.Protocol, error) {
 	if strings.Contains(portString, "-") {
+		rangePortsLength := 2
 		rangeSplitted := strings.Split(portString, "-")
-		if len(rangeSplitted) != 2 {
-			return 0, 0, "", fmt.Errorf("Can not convert '%s' to a port.", portString)
+		if len(rangeSplitted) != rangePortsLength {
+			return 0, 0, "", fmt.Errorf("cannot convert '%s' to a port.", portString)
 		}
 		fromString, toString := rangeSplitted[0], rangeSplitted[1]
 		toString, protocol, err := getPortAndProtocol(toString, portString)
@@ -871,9 +936,9 @@ func getRangePorts(portString string) (int32, int32, apiv1.Protocol, error) {
 }
 
 func getPortFromString(portString, originalPortString string) (int32, error) {
-	port, err := strconv.Atoi(portString)
+	port, err := strconv.ParseInt(portString, 10, 32)
 	if err != nil {
-		return 0, fmt.Errorf("Can not convert '%s' to a port: %s is not a number", originalPortString, portString)
+		return 0, fmt.Errorf("cannot convert '%s' to a port: %s is not a number", originalPortString, portString)
 	}
 	return int32(port), nil
 }
@@ -882,14 +947,15 @@ func getPortAndProtocol(portString, originalPortString string) (string, apiv1.Pr
 	var err error
 	protocol := apiv1.ProtocolTCP
 	if strings.Contains(portString, "/") {
+		protocolLength := 2
 		portProtocolSplitted := strings.Split(portString, "/")
-		if len(portProtocolSplitted) != 2 {
-			return "", protocol, fmt.Errorf("Can not convert '%s' to a port.", originalPortString)
+		if len(portProtocolSplitted) != protocolLength {
+			return "", protocol, fmt.Errorf("cannot convert '%s' to a port", originalPortString)
 		}
 		portString = portProtocolSplitted[0]
 		protocol, err = getProtocol(portProtocolSplitted[1])
 		if err != nil {
-			return "", protocol, fmt.Errorf("Can not convert '%s' to a port: %s", originalPortString, err.Error())
+			return "", protocol, fmt.Errorf("cannot convert '%s' to a port: %w", originalPortString, err)
 		}
 	}
 	return portString, protocol, nil
@@ -897,8 +963,9 @@ func getPortAndProtocol(portString, originalPortString string) (string, apiv1.Pr
 
 func getPortWithMapping(p *PortRaw, portString string) error {
 	localToContainer := strings.Split(portString, ":")
-	if len(localToContainer) > 3 {
-		return fmt.Errorf(malformedPortForward, portString)
+	maxLength := 3
+	if len(localToContainer) > maxLength {
+		return fmt.Errorf(forward.MalformedPortForward, portString)
 	}
 
 	containerPortString := localToContainer[len(localToContainer)-1]
@@ -913,12 +980,12 @@ func getPortWithMapping(p *PortRaw, portString string) error {
 		return err
 	}
 	if (p.ContainerFrom - p.ContainerTo) != (p.HostFrom - p.HostTo) {
-		return fmt.Errorf("Can not convert '%s' to a port: Ranges must be of the same length", portString)
+		return fmt.Errorf("cannot convert '%s' to a port: Ranges must be of the same length", portString)
 	}
 
 	if p.ContainerFrom == 0 {
 		if strings.Contains(hostPortString, ":") {
-			return fmt.Errorf("Can not convert '%s' to a port: Host IP is not allowed", portString)
+			return fmt.Errorf("cannot convert '%s' to a port: Host IP is not allowed", portString)
 		}
 
 		p.HostPort, err = getPortFromString(hostPortString, portString)
@@ -975,10 +1042,10 @@ func getRestartPolicy(svcName string, deployInfo *DeployInfoRaw, restartPolicy s
 	case "on-failure":
 		return apiv1.RestartPolicyOnFailure, nil
 	default:
-		return apiv1.RestartPolicyAlways, fmt.Errorf("Cannot create container for service %s: invalid restart policy '%s'", svcName, restart)
+		return apiv1.RestartPolicyAlways, fmt.Errorf("cannot create container for service %s: invalid restart policy '%s'", svcName, restart)
 	}
 }
-func unmarshalDeployResources(deployInfo *DeployInfoRaw, resources *StackResources, cpuCount, cpus, memLimit, memReservation Quantity) (*StackResources, error) {
+func unmarshalDeployResources(deployInfo *DeployInfoRaw, resources *StackResources, cpuCount, cpus, memLimit, memReservation Quantity) *StackResources {
 	if resources == nil {
 		resources = &StackResources{}
 	}
@@ -1003,20 +1070,20 @@ func unmarshalDeployResources(deployInfo *DeployInfoRaw, resources *StackResourc
 		resources.Requests.Memory = memReservation
 	}
 
-	return resources, nil
+	return resources
 }
 
-func unmarshalDeployReplicas(deployInfo *DeployInfoRaw, scale, replicas *int32) (int32, error) {
+func unmarshalDeployReplicas(deployInfo *DeployInfoRaw, scale, replicas *int32) int32 {
 	if replicas != nil {
-		return *replicas, nil
+		return *replicas
 	}
 	if deployInfo != nil && deployInfo.Replicas != nil {
-		return *deployInfo.Replicas, nil
+		return *deployInfo.Replicas
 	}
 	if scale != nil {
-		return *scale, nil
+		return *scale
 	}
-	return DefaultReplicasNumber, nil
+	return DefaultReplicasNumber
 }
 
 func (r DeployComposeResources) toServiceResources() ServiceResources {
@@ -1116,6 +1183,7 @@ func (healthcheckTest *HealtcheckTest) UnmarshalYAML(unmarshal func(interface{})
 	var rawList []string
 	err := unmarshal(&rawList)
 
+	healthCheckLength := 2
 	if err == nil {
 		if len(rawList) == 0 {
 			return fmt.Errorf("healtcheck.test can not be an empty list")
@@ -1127,7 +1195,7 @@ func (healthcheckTest *HealtcheckTest) UnmarshalYAML(unmarshal func(interface{})
 		case "CMD":
 			*healthcheckTest = rawList[1:]
 		case "CMD-SHELL":
-			if len(rawList) != 2 {
+			if len(rawList) != healthCheckLength {
 				return fmt.Errorf("'CMD-SHELL' healtcheck.test must have exactly 2 elements")
 			}
 			*healthcheckTest, err = shellquote.Split(rawList[1])
@@ -1152,49 +1220,6 @@ func (healthcheckTest *HealtcheckTest) UnmarshalYAML(unmarshal func(interface{})
 	return nil
 }
 
-// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
-func (v *StackVolume) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var raw string
-	err := unmarshal(&raw)
-	if err != nil {
-		return err
-	}
-
-	parts := strings.Split(raw, ":")
-	if runtime.GOOS == "windows" {
-		if len(parts) >= 3 {
-			localPath := fmt.Sprintf("%s:%s", parts[0], parts[1])
-			if filepath.IsAbs(localPath) {
-				parts = append([]string{localPath}, parts[2:]...)
-			}
-		}
-	}
-
-	if len(parts) == 2 {
-		v.LocalPath = parts[0]
-		v.RemotePath = parts[1]
-	} else if len(parts) == 1 {
-		v.RemotePath = parts[0]
-	} else {
-		return fmt.Errorf("Syntax error volumes should be 'local_path:remote_path' or 'remote_path'")
-	}
-
-	return nil
-}
-
-// MarshalYAML Implements the marshaler interface of the yaml pkg.
-func (v StackVolume) MarshalYAML() (interface{}, error) {
-	return v.RemotePath, nil
-}
-
-// MarshalYAML Implements the marshaler interface of the yaml pkg.
-func (v StackVolume) ToString() string {
-	if v.LocalPath != "" {
-		return fmt.Sprintf("%s:%s", v.LocalPath, v.RemotePath)
-	}
-	return v.RemotePath
-}
-
 func getProtocol(protocolName string) (apiv1.Protocol, error) {
 	protocolName = strings.ToLower(protocolName)
 	switch protocolName {
@@ -1209,13 +1234,32 @@ func getProtocol(protocolName string) (apiv1.Protocol, error) {
 	}
 }
 
+func hasUppercase(name string) bool {
+	for _, s := range name {
+		if unicode.IsUpper(s) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasEmptySpace(name string) bool {
+	return strings.Contains(name, " ")
+}
+
+func hasUnderscore(name string) bool {
+	return strings.Contains(name, "_")
+}
+
 func shouldBeSanitized(name string) bool {
-	return strings.Contains(name, " ") || strings.Contains(name, "_")
+	return hasEmptySpace(name) || hasUnderscore(name) || hasUppercase(name)
 }
 
 func sanitizeName(name string) string {
+	name = strings.TrimSpace(name)
 	name = strings.ReplaceAll(name, " ", "-")
 	name = strings.ReplaceAll(name, "_", "-")
+	name = strings.ToLower(name)
 	return name
 }
 
@@ -1535,6 +1579,9 @@ func validateExtensions(stack StackRaw) error {
 	}
 
 	for svcName, svc := range stack.Services {
+		if svc == nil {
+			return fmt.Errorf("%w: %w", oktetoErrors.ErrInvalidManifest, oktetoErrors.ErrServiceEmpty)
+		}
 		for extension := range svc.Extensions {
 			nonValidFields = append(nonValidFields, fmt.Sprintf("services[%s].%s", svcName, extension))
 		}
@@ -1545,11 +1592,11 @@ func validateExtensions(stack StackRaw) error {
 		}
 	}
 	if len(nonValidFields) == 1 {
-		return fmt.Errorf("Invalid compose manifest: Field '%s' is not supported.\n    More information is available here: https://okteto.com/docs/reference/compose/", nonValidFields[0])
+		return fmt.Errorf("invalid compose manifest: Field '%s' is not supported.\n    More information is available here: https://okteto.com/docs/reference/docker-compose/", nonValidFields[0])
 	} else if len(nonValidFields) > 1 {
-		return fmt.Errorf(`Invalid compose manifest: The following fields are not supported.
+		return fmt.Errorf(`invalid compose manifest: The following fields are not supported.
     - %s
-    More information is available here: https://okteto.com/docs/reference/compose/`, strings.Join(nonValidFields, "\n    - "))
+    More information is available here: https://okteto.com/docs/reference/docker-compose/`, strings.Join(nonValidFields, "\n    - "))
 	}
 	return nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,72 +15,50 @@ package test
 
 import (
 	"context"
+	"strings"
 
-	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/log/io"
 	"github.com/okteto/okteto/pkg/types"
 )
 
 // FakeOktetoBuilder emulates an okteto image builder
 type FakeOktetoBuilder struct {
+	Registry fakeOktetoRegistryInterface
 	Err      []error
-	Registry *FakeOktetoRegistry
+}
+
+type fakeOktetoRegistryInterface interface {
+	AddImageByOpts(opts *types.BuildOptions) error
 }
 
 // NewFakeOktetoBuilder creates a FakeOktetoBuilder
-func NewFakeOktetoBuilder(registry *FakeOktetoRegistry, errors ...error) *FakeOktetoBuilder {
+func NewFakeOktetoBuilder(registry fakeOktetoRegistryInterface, errors ...error) *FakeOktetoBuilder {
 	return &FakeOktetoBuilder{
 		Err:      errors,
 		Registry: registry,
 	}
 }
 
+func (fb *FakeOktetoBuilder) GetBuilder() string {
+	return "test"
+}
+
 // Run simulates a build
-func (fb *FakeOktetoBuilder) Run(_ context.Context, opts *types.BuildOptions) error {
+func (fb *FakeOktetoBuilder) Run(_ context.Context, opts *types.BuildOptions, _ *io.Controller) error {
 	if fb.Err != nil {
 		err := fb.Err[0]
 		fb.Err = fb.Err[1:]
 		return err
 	}
+
 	if opts.Tag != "" {
-		fb.Registry.AddImageByName(opts.Tag)
+		for _, img := range strings.Split(opts.Tag, ",") {
+			newOpts := *opts
+			newOpts.Tag = img
+			if err := fb.Registry.AddImageByOpts(&newOpts); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
-}
-
-// FakeOktetoRegistry emulates an okteto image registry
-type FakeOktetoRegistry struct {
-	Err      error
-	Registry map[string]*FakeImage
-}
-
-// FakeImage represents the data from an image
-type FakeImage struct {
-	Registry string
-	Repo     string
-	Tag      string
-	ImageRef string
-}
-
-// NewFakeOktetoRegistry creates a new registry if not already created
-func NewFakeOktetoRegistry(err error) *FakeOktetoRegistry {
-	return &FakeOktetoRegistry{
-		Err:      err,
-		Registry: map[string]*FakeImage{},
-	}
-}
-
-// AddImageByName adds an image to the registry
-func (fb *FakeOktetoRegistry) AddImageByName(images ...string) error {
-	for _, image := range images {
-		fb.Registry[image] = &FakeImage{}
-	}
-	return nil
-}
-
-// GetImageTagWithDigest returns the image tag digest
-func (fb *FakeOktetoRegistry) GetImageTagWithDigest(imageTag string) (string, error) {
-	if _, ok := fb.Registry[imageTag]; !ok {
-		return "", oktetoErrors.ErrNotFound
-	}
-	return imageTag, nil
 }

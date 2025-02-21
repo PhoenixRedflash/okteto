@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,34 +15,80 @@ package okteto
 
 import (
 	"context"
-	"fmt"
-	"regexp"
 
-	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/types"
 	"github.com/shurcooL/graphql"
 )
 
 const (
-	// Maximum number of characters allowed in a namespace name
-	MAX_ALLOWED_CHARS = 63
+	RunningStatus       = "running"
+	NotRunningStatus    = "not-running"
+	CompletedStatus     = "completed"
+	PullingStatus       = "pulling"
+	ProgressingStatus   = "progressing"
+	BootingStatus       = "booting"
+	ErrorStatus         = "error"
+	UnschedulableStatus = "unschedulable"
 )
 
-type namespaceClient struct {
-	client *graphql.Client
+var TransitionStatus = map[string]bool{
+	BootingStatus:       true,
+	ProgressingStatus:   true,
+	PullingStatus:       true,
+	UnschedulableStatus: true,
 }
 
-func newNamespaceClient(client *graphql.Client) *namespaceClient {
+type namespaceClient struct {
+	client graphqlClientInterface
+}
+
+type createNamespaceMutation struct {
+	Response namespaceID `graphql:"createSpace(name: $name)"`
+}
+type deleteNamespaceMutation struct {
+	Response namespaceID `graphql:"deleteSpace(id: $id)"`
+}
+
+type addMembersMutation struct {
+	Response namespaceID `graphql:"updateSpace(id: $id, members: $members)"`
+}
+
+type listNamespacesQuery struct {
+	Response []namespaceStatus `graphql:"spaces"`
+}
+
+type getNamespaceQuery struct {
+	Response namespaceStatus `graphql:"space(id: $id)"`
+}
+
+type wakeNamespaceMutation struct {
+	Response namespaceID `graphql:"wakeSpace(space: $space)"`
+}
+
+type namespaceDestroyAllMutation struct {
+	Response namespaceID `graphql:"destroyAllInSpace(id: $id, includeVolumes: $includeVolumes)"`
+}
+
+type sleepNamespaceMutation struct {
+	Response namespaceID `graphql:"sleepSpace(space: $space)"`
+}
+
+type namespaceStatus struct {
+	Id     graphql.String
+	Status graphql.String
+}
+
+type namespaceID struct {
+	Id graphql.String
+}
+
+func newNamespaceClient(client graphqlClientInterface) *namespaceClient {
 	return &namespaceClient{client: client}
 }
 
-// CreateNamespace creates a namespace
+// Create creates a namespace
 func (c *namespaceClient) Create(ctx context.Context, namespace string) (string, error) {
-	var mutation struct {
-		Space struct {
-			Id graphql.String
-		} `graphql:"createSpace(name: $name)"`
-	}
+	var mutation createNamespaceMutation
 	variables := map[string]interface{}{
 		"name": graphql.String(namespace),
 	}
@@ -51,17 +97,12 @@ func (c *namespaceClient) Create(ctx context.Context, namespace string) (string,
 		return "", err
 	}
 
-	return string(mutation.Space.Id), nil
+	return string(mutation.Response.Id), nil
 }
 
-// List list namespaces
+// List lists the namespaces
 func (c *namespaceClient) List(ctx context.Context) ([]types.Namespace, error) {
-	var queryStruct struct {
-		Spaces []struct {
-			Id     graphql.String
-			Status graphql.String
-		} `graphql:"spaces"`
-	}
+	var queryStruct listNamespacesQuery
 
 	err := query(ctx, &queryStruct, nil, c.client)
 	if err != nil {
@@ -69,7 +110,7 @@ func (c *namespaceClient) List(ctx context.Context) ([]types.Namespace, error) {
 	}
 
 	result := make([]types.Namespace, 0)
-	for _, space := range queryStruct.Spaces {
+	for _, space := range queryStruct.Response {
 		result = append(result, types.Namespace{
 			ID:     string(space.Id),
 			Status: string(space.Status),
@@ -79,13 +120,9 @@ func (c *namespaceClient) List(ctx context.Context) ([]types.Namespace, error) {
 	return result, nil
 }
 
-// AddNamespaceMembers adds members to a namespace
+// AddMembers adds members to a namespace
 func (c *namespaceClient) AddMembers(ctx context.Context, namespace string, members []string) error {
-	var mutation struct {
-		Space struct {
-			Id graphql.String
-		} `graphql:"updateSpace(id: $id, members: $members)"`
-	}
+	var mutation addMembersMutation
 
 	membersVariable := make([]graphql.String, 0)
 	for _, m := range members {
@@ -103,13 +140,9 @@ func (c *namespaceClient) AddMembers(ctx context.Context, namespace string, memb
 	return nil
 }
 
-// DeleteNamespace deletes a namespace
+// Delete deletes a namespace
 func (c *namespaceClient) Delete(ctx context.Context, namespace string) error {
-	var mutation struct {
-		Space struct {
-			Id graphql.String
-		} `graphql:"deleteSpace(id: $id)"`
-	}
+	var mutation deleteNamespaceMutation
 	variables := map[string]interface{}{
 		"id": graphql.String(namespace),
 	}
@@ -121,30 +154,9 @@ func (c *namespaceClient) Delete(ctx context.Context, namespace string) error {
 	return nil
 }
 
-func validateNamespace(namespace, object string) error {
-	if len(namespace) > MAX_ALLOWED_CHARS {
-		return oktetoErrors.UserError{
-			E:    fmt.Errorf("invalid %s name", object),
-			Hint: fmt.Sprintf("%s name must be shorter than 63 characters.", object),
-		}
-	}
-	nameValidationRegex := regexp.MustCompile("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
-	if !nameValidationRegex.MatchString(namespace) {
-		return oktetoErrors.UserError{
-			E:    fmt.Errorf("invalid %s name", object),
-			Hint: fmt.Sprintf("%s name must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character", object),
-		}
-	}
-	return nil
-}
-
-// SleepNamespace sleeps a namespace
-func (c *namespaceClient) SleepNamespace(ctx context.Context, namespace string) error {
-	var mutation struct {
-		Space struct {
-			Id graphql.String
-		} `graphql:"sleepSpace(space: $space)"`
-	}
+// Sleep sleeps a namespace
+func (c *namespaceClient) Sleep(ctx context.Context, namespace string) error {
+	var mutation sleepNamespaceMutation
 	variables := map[string]interface{}{
 		"space": graphql.String(namespace),
 	}
@@ -154,4 +166,52 @@ func (c *namespaceClient) SleepNamespace(ctx context.Context, namespace string) 
 	}
 
 	return nil
+}
+
+// DestroyAll deletes a namespace
+func (c *namespaceClient) DestroyAll(ctx context.Context, namespace string, destroyVolumes bool) error {
+	var mutation namespaceDestroyAllMutation
+	// includingVolumes so everything is cleaned up by default with this cmd
+	variables := map[string]interface{}{
+		"id":             graphql.String(namespace),
+		"includeVolumes": graphql.Boolean(destroyVolumes),
+	}
+	err := mutate(ctx, &mutation, variables, c.client)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Wake wakes a namespace
+func (c *namespaceClient) Wake(ctx context.Context, namespace string) error {
+	var mutation wakeNamespaceMutation
+	variables := map[string]interface{}{
+		"space": graphql.String(namespace),
+	}
+	err := mutate(ctx, &mutation, variables, c.client)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Get returns the given namespace id and status if found
+func (c *namespaceClient) Get(ctx context.Context, namespace string) (*types.Namespace, error) {
+	var queryStruct getNamespaceQuery
+	variables := map[string]interface{}{
+		"id": graphql.String(namespace),
+	}
+
+	err := query(ctx, &queryStruct, variables, c.client)
+	if err != nil {
+		return nil, err
+	}
+
+	return &types.Namespace{
+		ID:     string(queryStruct.Response.Id),
+		Status: string(queryStruct.Response.Status),
+	}, nil
 }

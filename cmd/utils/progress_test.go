@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,8 +20,8 @@ import (
 func Test_renderProgressBar(t *testing.T) {
 	var tests = []struct {
 		expected string
-		progress float64
 		name     string
+		progress float64
 	}{
 		{
 			expected: "[__________________________________________________]   0%",
@@ -56,7 +56,7 @@ func Test_renderProgressBar(t *testing.T) {
 
 }
 
-func Test_renderProgressBarFuzz(t *testing.T) {
+func Test_renderProgressBarFuzz(_ *testing.T) {
 	for i := 0.0; i < 100.0; i = i + 0.01 {
 		RenderProgressBar("", i, 0.35)
 	}

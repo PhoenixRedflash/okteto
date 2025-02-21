@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,46 +14,71 @@
 package context
 
 import (
-	"context"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/okteto/okteto/internal/test"
+	"github.com/okteto/okteto/pkg/constants"
 	"github.com/okteto/okteto/pkg/okteto"
 )
 
 func Test_deleteContext(t *testing.T) {
-	ctx := context.Background()
 
 	var tests = []struct {
+		ctxStore     *okteto.ContextStore
 		name         string
-		ctxStore     *okteto.OktetoContextStore
-		toDelete     string
 		afterContext string
+		toDelete     []string
 		expectedErr  bool
 	}{
 		{
-			name: "deleting existing context",
-			ctxStore: &okteto.OktetoContextStore{
+			name: "deleting one existing context",
+			ctxStore: &okteto.ContextStore{
 				CurrentContext: "test",
-				Contexts: map[string]*okteto.OktetoContext{
+				Contexts: map[string]*okteto.Context{
 					"test": {},
 				},
 			},
-			toDelete:     "test",
+			toDelete:     []string{"test"},
+			afterContext: "",
+			expectedErr:  false,
+		},
+		{
+			name: "deleting more than one existing context",
+			ctxStore: &okteto.ContextStore{
+				CurrentContext: "test1",
+				Contexts: map[string]*okteto.Context{
+					"test1": {},
+					"test2": {},
+				},
+			},
+			toDelete:     []string{"test1", "test2"},
 			afterContext: "",
 			expectedErr:  false,
 		},
 		{
 			name: "deleting non existing context",
-			ctxStore: &okteto.OktetoContextStore{
+			ctxStore: &okteto.ContextStore{
 				CurrentContext: "test",
-				Contexts: map[string]*okteto.OktetoContext{
+				Contexts: map[string]*okteto.Context{
 					"test": {},
 				},
 			},
-			toDelete:     "non-existing-test",
+			toDelete:     []string{"non-existing-test"},
 			afterContext: "test",
+			expectedErr:  true,
+		},
+		{
+			name: "deleting one existing and one non existing context",
+			ctxStore: &okteto.ContextStore{
+				CurrentContext: "test",
+				Contexts: map[string]*okteto.Context{
+					"test": {},
+				},
+			},
+			toDelete:     []string{"test", "non-existing-test"},
+			afterContext: "",
 			expectedErr:  true,
 		},
 	}
@@ -65,11 +90,12 @@ func Test_deleteContext(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer os.Remove(file)
+			t.Setenv(constants.OktetoHomeEnvVar, filepath.Dir(file))
 			okteto.CurrentStore = tt.ctxStore
-			if err := Delete(ctx, tt.toDelete); err == nil && tt.expectedErr || err != nil && !tt.expectedErr {
+			if err := Delete(tt.toDelete); err == nil && tt.expectedErr || err != nil && !tt.expectedErr {
 				t.Fatal(err)
 			}
-			if okteto.ContextStore().CurrentContext != tt.afterContext {
+			if okteto.GetContextStore().CurrentContext != tt.afterContext {
 				t.Fatal("not delete correctly")
 			}
 		})

@@ -1,44 +1,34 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package model
 
 import (
 	"bytes"
-	"fmt"
-	"strings"
 
+	"github.com/okteto/okteto/pkg/env"
 	yaml3 "gopkg.in/yaml.v3"
 )
 
 func expandEnvScalarNode(node *yaml3.Node) (*yaml3.Node, error) {
-	switch node.Kind {
-	// when is a ScalarNode, replace its value with the ENV replaced
-	case yaml3.ScalarNode:
-		expandValue, err := ExpandEnv(node.Value, true)
+	if node.Kind == yaml3.ScalarNode {
+		// when is a ScalarNode, replace its value with the ENV replaced
+		expandValue, err := env.ExpandEnv(node.Value)
 		if err != nil {
 			return node, err
 		}
 		node.Value = expandValue
 		return node, nil
-	// when is a Sequence and starts with $ can be a list of envs, so transform the list to key=value format
-	case yaml3.SequenceNode:
-		for indx, subNode := range node.Content {
-			if strings.HasPrefix(subNode.Value, "$") {
-				value := subNode.Value
-				key := strings.TrimSuffix(strings.TrimPrefix(value, "$"), "=")
-				node.Content[indx].Value = fmt.Sprintf("%s=%s", key, value)
-			}
-		}
-	// when MappingNode and only the ENV, transform the node by adding a ScalarNode so there is key and value nodes for the map
-	case yaml3.MappingNode:
-		for indx, subNode := range node.Content {
-			value := subNode.Value
-			if indx%2 == 0 && strings.HasPrefix(value, "$") && node.Content[indx+1] != nil && node.Content[indx+1].Value == "" {
-				node.Content[indx].Value = strings.TrimPrefix(value, "$")
-				node.Content[indx+1] = &yaml3.Node{
-					Kind:  yaml3.ScalarNode,
-					Value: value,
-				}
-			}
-		}
 	}
 
 	for indx, subNode := range node.Content {

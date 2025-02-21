@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,11 +19,17 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/sirupsen/logrus"
 )
 
-//JSONWriter writes into a JSON terminal
+const (
+	// UnexpectedErrorStage stage to be used in the staged logs when there is an unexpected error
+	UnexpectedErrorStage = "Internal server error"
+)
+
+// JSONWriter writes into a JSON terminal
 type JSONWriter struct {
 	out  *logrus.Logger
 	file *logrus.Entry
@@ -36,7 +42,7 @@ type jsonMessage struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
-//JSONLogFormat formats the messages into json struct
+// JSONLogFormat formats the messages into json struct
 type JSONLogFormat struct {
 	Level     string `json:"level"`
 	Stage     string `json:"stage"`
@@ -44,8 +50,8 @@ type JSONLogFormat struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
-//Format formats the message
-func (f *JSONLogFormat) Format(entry *logrus.Entry) ([]byte, error) {
+// Format formats the message
+func (*JSONLogFormat) Format(entry *logrus.Entry) ([]byte, error) {
 	level := strings.ToLower(entry.Level.String())
 	if entry.Level == logrus.WarnLevel {
 		level = "info"
@@ -60,11 +66,11 @@ func (f *JSONLogFormat) Format(entry *logrus.Entry) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	messageJSON = []byte(string(messageJSON[:]) + "\n")
+	messageJSON = []byte(string(messageJSON) + "\n")
 	return messageJSON, nil
 }
 
-//newJSONWriter creates a new JSONWriter
+// newJSONWriter creates a new JSONWriter
 func newJSONWriter(out *logrus.Logger, file *logrus.Entry) *JSONWriter {
 	return &JSONWriter{
 		out:  out,
@@ -154,7 +160,7 @@ func (w *JSONWriter) Information(format string, args ...interface{}) {
 }
 
 // Question prints a message with the question symbol first, and the text in magenta
-func (*JSONWriter) Question(format string, args ...interface{}) error {
+func (*JSONWriter) Question(_ string, _ ...interface{}) error {
 	return fmt.Errorf("can't ask questions on json mode")
 }
 
@@ -193,7 +199,9 @@ func (w *JSONWriter) Fail(format string, args ...interface{}) {
 	log.out.Infof(format, args...)
 	msg := fmt.Sprintf("%s %s", errorSymbol, fmt.Sprintf(format, args...))
 	if msg != "" {
-
+		if log.stage == "" {
+			log.stage = UnexpectedErrorStage
+		}
 		msg = convertToJSON(ErrorLevel, log.stage, msg)
 		if msg != "" {
 			log.buf.WriteString(msg)
@@ -251,18 +259,18 @@ func (w *JSONWriter) Print(args ...interface{}) {
 
 }
 
-//Printf writes a line with format
+// Printf writes a line with format
 func (w *JSONWriter) Printf(format string, a ...interface{}) {
 	w.Fprintf(w.out.Out, format, a...)
 }
 
-//IsInteractive checks if the writer is interactive
+// IsInteractive checks if the writer is interactive
 func (*JSONWriter) IsInteractive() bool {
 	return false
 }
 
 func convertToJSON(level, stage, message string) string {
-	message = strings.TrimSpace(message)
+	message = strings.TrimRightFunc(message, unicode.IsSpace)
 	if stage == "" || message == "" {
 		return ""
 	}
@@ -272,8 +280,12 @@ func convertToJSON(level, stage, message string) string {
 		Stage:     stage,
 		Timestamp: time.Now().Unix(),
 	}
-	messageJSON, _ := json.Marshal(messageStruct)
-	return string(messageJSON[:])
+	messageJSON, err := json.Marshal(messageStruct)
+	if err != nil {
+		Infof("error marshalling message: %s", err)
+		return ""
+	}
+	return string(messageJSON)
 }
 
 // AddToBuffer logs into the buffer and writes to stdout if its a json writer
@@ -287,12 +299,14 @@ func (w *JSONWriter) AddToBuffer(level, format string, a ...interface{}) {
 	}
 }
 
-// AddToBuffer logs into the buffer but does not print anything
+// Write logs into the buffer but does not print anything
 func (w *JSONWriter) Write(p []byte) (n int, err error) {
 	msg := string(p)
 	msg = convertToJSON(InfoLevel, log.stage, msg)
 	if msg != "" {
-		w.out.Out.Write([]byte(""))
+		if _, err := w.out.Out.Write([]byte("")); err != nil {
+			return 0, err
+		}
 	}
 	if !strings.HasSuffix(msg, "\n") {
 		msg += "\n"

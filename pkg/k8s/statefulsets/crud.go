@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,39 +20,38 @@ import (
 	"regexp"
 	"strings"
 
-	apiv1 "k8s.io/api/core/v1"
-	"k8s.io/utils/pointer"
-
 	oktetoErrors "github.com/okteto/okteto/pkg/errors"
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 	appsv1 "k8s.io/api/apps/v1"
+	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 )
 
 type patchAnnotations struct {
+	Value map[string]string `json:"value"`
 	Op    string            `json:"op"`
 	Path  string            `json:"path"`
-	Value map[string]string `json:"value"`
 }
 
-//Sandbox returns a default statefulset for a given dev
-func Sandbox(dev *model.Dev) *appsv1.StatefulSet {
-	image := dev.Image.Name
+// Sandbox returns a default statefulset for a given dev
+func Sandbox(dev *model.Dev, namespace string) *appsv1.StatefulSet {
+	image := dev.Image
 	if image == "" {
 		image = model.DefaultImage
 	}
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        dev.Name,
-			Namespace:   dev.Namespace,
+			Namespace:   namespace,
 			Labels:      model.Labels{},
 			Annotations: model.Annotations{},
 		},
 		Spec: appsv1.StatefulSetSpec{
-			Replicas: pointer.Int32Ptr(1),
+			Replicas: ptr.To(int32(1)),
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
 				Type: appsv1.RollingUpdateStatefulSetStrategyType,
 			},
@@ -70,7 +69,8 @@ func Sandbox(dev *model.Dev) *appsv1.StatefulSet {
 				},
 				Spec: apiv1.PodSpec{
 					ServiceAccountName:            dev.ServiceAccount,
-					TerminationGracePeriodSeconds: pointer.Int64Ptr(0),
+					PriorityClassName:             dev.PriorityClassName,
+					TerminationGracePeriodSeconds: ptr.To(int64(0)),
 					Containers: []apiv1.Container{
 						{
 							Name:            "dev",
@@ -84,7 +84,7 @@ func Sandbox(dev *model.Dev) *appsv1.StatefulSet {
 	}
 }
 
-//Deploy creates or updates a statefulset
+// Deploy creates or updates a statefulset
 func Deploy(ctx context.Context, sfs *appsv1.StatefulSet, c kubernetes.Interface) (*appsv1.StatefulSet, error) {
 	sfs.ResourceVersion = ""
 	result, err := c.AppsV1().StatefulSets(sfs.Namespace).Update(ctx, sfs, metav1.UpdateOptions{})
@@ -99,7 +99,7 @@ func Deploy(ctx context.Context, sfs *appsv1.StatefulSet, c kubernetes.Interface
 	return c.AppsV1().StatefulSets(sfs.Namespace).Create(ctx, sfs, metav1.CreateOptions{})
 }
 
-//List returns the list of statefulsets
+// List returns the list of statefulsets
 func List(ctx context.Context, namespace, labels string, c kubernetes.Interface) ([]appsv1.StatefulSet, error) {
 	sfsList, err := c.AppsV1().StatefulSets(namespace).List(
 		ctx,
@@ -113,12 +113,12 @@ func List(ctx context.Context, namespace, labels string, c kubernetes.Interface)
 	return sfsList.Items, nil
 }
 
-//Get returns a deployment object by name
+// Get returns a deployment object by name
 func Get(ctx context.Context, name, namespace string, c kubernetes.Interface) (*appsv1.StatefulSet, error) {
 	return c.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
 }
 
-//GetByDev returns a statefulset object given a dev struct (by name or by labels)
+// GetByDev returns a statefulset object given a dev struct (by name or by labels)
 func GetByDev(ctx context.Context, dev *model.Dev, namespace string, c kubernetes.Interface) (*appsv1.StatefulSet, error) {
 	if len(dev.Selector) == 0 {
 		return Get(ctx, dev.Name, namespace, c)
@@ -148,13 +148,13 @@ func GetByDev(ctx context.Context, dev *model.Dev, namespace string, c kubernete
 	return validStatefulsets[0], nil
 }
 
-//Destroy removes a statefulset object given its name and namespace
+// Destroy removes a statefulset object given its name and namespace
 func Destroy(ctx context.Context, name, namespace string, c kubernetes.Interface) error {
 	if err := c.AppsV1().StatefulSets(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
 		if oktetoErrors.IsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("error deleting kubernetes job: %s", err)
+		return fmt.Errorf("error deleting kubernetes job: %w", err)
 	}
 	oktetoLog.Infof("statefulset '%s' deleted", name)
 	return nil
@@ -168,17 +168,7 @@ func IsRunning(ctx context.Context, namespace, svcName string, c kubernetes.Inte
 	return sfs.Status.ReadyReplicas > 0
 }
 
-//IsDevModeOn returns if a statefulset is in devmode
-func IsDevModeOn(s *appsv1.StatefulSet) bool {
-	labels := s.GetObjectMeta().GetLabels()
-	if labels == nil {
-		return false
-	}
-	_, ok := labels[model.DevLabel]
-	return ok
-}
-
-//CheckConditionErrors checks errors in conditions
+// CheckConditionErrors checks errors in conditions
 func CheckConditionErrors(sfs *appsv1.StatefulSet, dev *model.Dev) error {
 	for _, c := range sfs.Status.Conditions {
 		if c.Reason == "FailedCreate" && c.Status == apiv1.ConditionTrue {
@@ -194,7 +184,7 @@ func CheckConditionErrors(sfs *appsv1.StatefulSet, dev *model.Dev) error {
 			} else if isResourcesRelatedError(c.Message) {
 				return getResourceLimitError(c.Message, dev)
 			}
-			return fmt.Errorf(c.Message)
+			return fmt.Errorf("%s", c.Message)
 		}
 	}
 	return nil
@@ -210,7 +200,7 @@ func isResourcesRelatedError(errorMessage string) bool {
 func getResourceLimitError(errorMessage string, dev *model.Dev) error {
 	var errorToReturn string
 	if strings.Contains(errorMessage, "maximum cpu usage") {
-		cpuMaximumRegex, _ := regexp.Compile(`cpu usage per Pod is (\d*\w*)`)
+		cpuMaximumRegex := regexp.MustCompile(`cpu usage per Pod is (\d*\w*)`)
 		maximumCpuPerPod := cpuMaximumRegex.FindStringSubmatch(errorMessage)[1]
 		var manifestCpu string
 		if limitCpu, ok := dev.Resources.Limits[apiv1.ResourceCPU]; ok {
@@ -219,7 +209,7 @@ func getResourceLimitError(errorMessage string, dev *model.Dev) error {
 		errorToReturn += fmt.Sprintf("The value of resources.limits.cpu in your okteto manifest (%s) exceeds the maximum CPU limit per pod (%s). ", manifestCpu, maximumCpuPerPod)
 	}
 	if strings.Contains(errorMessage, "maximum memory usage") {
-		memoryMaximumRegex, _ := regexp.Compile(`memory usage per Pod is (\d*\w*)`)
+		memoryMaximumRegex := regexp.MustCompile(`memory usage per Pod is (\d*\w*)`)
 		maximumMemoryPerPod := memoryMaximumRegex.FindStringSubmatch(errorMessage)[1]
 		var manifestMemory string
 		if limitMemory, ok := dev.Resources.Limits[apiv1.ResourceMemory]; ok {
@@ -227,7 +217,7 @@ func getResourceLimitError(errorMessage string, dev *model.Dev) error {
 		}
 		errorToReturn += fmt.Sprintf("The value of resources.limits.memory in your okteto manifest (%s) exceeds the maximum memory limit per pod (%s). ", manifestMemory, maximumMemoryPerPod)
 	}
-	return fmt.Errorf(strings.TrimSpace(errorToReturn))
+	return fmt.Errorf("%s", strings.TrimSpace(errorToReturn))
 }
 
 // PatchAnnotations patches the statefulset annotations

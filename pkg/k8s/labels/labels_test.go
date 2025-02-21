@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -62,11 +62,11 @@ func TestTransformLabelsToSelector(t *testing.T) {
 
 func TestSetInMetadata(t *testing.T) {
 	tests := []struct {
-		name     string
 		om       *metav1.ObjectMeta
+		expected map[string]string
+		name     string
 		key      string
 		value    string
-		expected map[string]string
 	}{
 		{
 			name:     "empty-labels",

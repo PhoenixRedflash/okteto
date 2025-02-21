@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,8 +19,8 @@ import (
 
 func Test_needsDatabaseReset(t *testing.T) {
 	tests := []struct {
-		name                      string
 		wfc                       *waitForCompletion
+		name                      string
 		previousLocalGlobalBytes  int64
 		previousRemoteGlobalBytes int64
 		globalBytesRetries        int64
@@ -138,8 +138,8 @@ func Test_needsDatabaseReset(t *testing.T) {
 
 func Test_isCompleted(t *testing.T) {
 	tests := []struct {
-		name               string
 		wfc                *waitForCompletion
+		name               string
 		needDeletesRetries int64
 		want               bool
 	}{

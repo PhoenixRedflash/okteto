@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,19 +16,38 @@ package preview
 import (
 	"context"
 
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/types"
 	"github.com/spf13/cobra"
 )
 
-//Preview preview management commands
+type Command struct {
+	okClient types.OktetoInterface
+}
+
+// NewCommand creates a namespace command for previews
+func NewCommand() (*Command, error) {
+	c, err := okteto.NewOktetoClient()
+	if err != nil {
+		return nil, err
+	}
+	return &Command{
+		okClient: c,
+	}, nil
+}
+
+// Preview preview management commands
 func Preview(ctx context.Context) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "preview",
-		Short: "Preview environment management commands",
+		Short: "Preview Environment management commands",
 	}
 
 	cmd.AddCommand(Deploy(ctx))
 	cmd.AddCommand(Destroy(ctx))
 	cmd.AddCommand(List(ctx))
 	cmd.AddCommand(Endpoints(ctx))
+	cmd.AddCommand(Sleep(ctx))
+	cmd.AddCommand(Wake(ctx))
 	return cmd
 }

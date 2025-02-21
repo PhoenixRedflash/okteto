@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,17 +19,17 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestCreate(t *testing.T) {
 	ctx := context.Background()
 	job := &batchv1.Job{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "test",
 		},
@@ -54,7 +54,7 @@ func TestUpdate(t *testing.T) {
 	ctx := context.Background()
 	labels := map[string]string{"key": "value"}
 	job := &batchv1.Job{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "test",
 			Labels:    labels,
@@ -65,7 +65,7 @@ func TestUpdate(t *testing.T) {
 
 	updatedLabels := map[string]string{"key": "value", "key2": "value2"}
 	updatedJob := &batchv1.Job{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "test",
 			Labels:    updatedLabels,
@@ -87,10 +87,10 @@ func TestUpdate(t *testing.T) {
 
 func TestDestroy(t *testing.T) {
 	var tests = []struct {
+		job       *batchv1.Job
 		name      string
 		jobName   string
 		namespace string
-		job       *batchv1.Job
 		deleted   bool
 	}{
 		{
@@ -130,7 +130,9 @@ func TestDestroy(t *testing.T) {
 				t.Fatalf("unexpected error '%s'", err)
 			}
 
-			if list, _ := clientset.CoreV1().Pods(tt.namespace).List(ctx, v1.ListOptions{}); tt.deleted && len(list.Items) != 0 {
+			list, err := clientset.CoreV1().Pods(tt.namespace).List(ctx, metav1.ListOptions{})
+			assert.NoError(t, err)
+			if tt.deleted && len(list.Items) != 0 {
 				t.Fatal("Not deleted job pods")
 			}
 		})
@@ -141,7 +143,7 @@ func TestList(t *testing.T) {
 	ctx := context.Background()
 
 	job := &batchv1.Job{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "test",
 		},
@@ -163,24 +165,24 @@ func TestIsSuccedded(t *testing.T) {
 	ctx := context.Background()
 
 	succeedjob := &batchv1.Job{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "succededtest",
 			Namespace: "test",
 		},
 		Spec: batchv1.JobSpec{
-			Completions: pointer.Int32Ptr(1),
+			Completions: ptr.To(int32(1)),
 		},
 		Status: batchv1.JobStatus{
 			Succeeded: 1,
 		},
 	}
 	failedjob := &batchv1.Job{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "failedtest",
 			Namespace: "test",
 		},
 		Spec: batchv1.JobSpec{
-			Completions: pointer.Int32Ptr(2),
+			Completions: ptr.To(int32(2)),
 		},
 		Status: batchv1.JobStatus{
 			Succeeded: 1,
@@ -201,26 +203,26 @@ func TestIsFailed(t *testing.T) {
 	ctx := context.Background()
 
 	succeedjob := &batchv1.Job{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "succededtest",
 			Namespace: "test",
 		},
 		Spec: batchv1.JobSpec{
-			Completions:  pointer.Int32Ptr(1),
-			BackoffLimit: pointer.Int32Ptr(0),
+			Completions:  ptr.To(int32(1)),
+			BackoffLimit: ptr.To(int32(0)),
 		},
 		Status: batchv1.JobStatus{
 			Failed: 1,
 		},
 	}
 	failedjob := &batchv1.Job{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "failedtest",
 			Namespace: "test",
 		},
 		Spec: batchv1.JobSpec{
-			Completions:  pointer.Int32Ptr(2),
-			BackoffLimit: pointer.Int32Ptr(0),
+			Completions:  ptr.To(int32(2)),
+			BackoffLimit: ptr.To(int32(0)),
 		},
 		Status: batchv1.JobStatus{
 			Failed: 0,

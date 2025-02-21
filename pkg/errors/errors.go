@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -29,6 +29,9 @@ type UserError struct {
 func (u UserError) Error() string {
 	return u.E.Error()
 }
+func (e UserError) Unwrap() error {
+	return e.E
+}
 
 // CommandError is meant for errors displayed to the user. It can include a message and a hint
 type CommandError struct {
@@ -41,18 +44,32 @@ func (u CommandError) Error() string {
 	return fmt.Sprintf("%s: %s", u.E.Error(), strings.ToLower(u.Reason.Error()))
 }
 
+// NotLoggedError is raised when the user is not logged in okteto
+type NotLoggedError struct {
+	Context string
+}
+
+// Error returns the error message
+func (e NotLoggedError) Error() string {
+	return fmt.Sprintf(ErrNotLogged, e.Context)
+}
+
+func (NotLoggedError) Unwrap() error {
+	return ErrNotLoggedMsg
+}
+
 var (
 	// ErrCommandFailed is raised when the command execution failed
 	ErrCommandFailed = errors.New("command execution failed")
+
+	// ErrNotLoggedMsg is raised when the user is not logged in okteto
+	ErrNotLoggedMsg = errors.New("user is not logged in okteto")
 
 	// ErrNotLogged is raised when we can't get the user token
 	ErrNotLogged = "your token is invalid. Please run 'okteto context use %s' and try again"
 
 	// ErrCtxNotSet is raised when we don't have ctx set
 	ErrCtxNotSet = fmt.Errorf("your context is not set. Please run 'okteto context' and select your context")
-
-	// ErrNotOktetoCluster is raised when we a command is only available on an okteto cluster
-	ErrNotOktetoCluster = fmt.Errorf("user is not logged in okteto cluster. Please run 'okteto context use' and select your context")
 
 	// ErrNotFound is raised when an object is not found
 	ErrNotFound = fmt.Errorf("not found")
@@ -78,6 +95,9 @@ var (
 	// ErrInsufficientSpace is raised when syncthing fails with no space available
 	ErrInsufficientSpace = fmt.Errorf("there isn't enough disk space available to synchronize your files")
 
+	// ErrInsufficientSpaceOnUserDisk is raised when syncthing fails with no space available related to the user's disk
+	ErrInsufficientSpaceOnUserDisk = fmt.Errorf("there isn't enough disk space available on your machine to continue")
+
 	// ErrBusySyncthing is raised when syncthing is busy
 	ErrBusySyncthing = fmt.Errorf("synchronization service is unresponsive")
 
@@ -90,9 +110,6 @@ var (
 	// ErrLostSyncthing is raised when we lose connectivity with syncthing
 	ErrLostSyncthing = fmt.Errorf("synchronization service is disconnected")
 
-	// ErrManifestNotFound is raised if the okteto manifest is not found
-	ErrManifestNotFound = fmt.Errorf("okteto manifest not found")
-
 	// ErrNotInDevMode is raised when the deployment is not in dev mode
 	ErrNotInDevMode = fmt.Errorf("deployment is not in development mode anymore")
 
@@ -100,16 +117,19 @@ var (
 	ErrDevPodDeleted = fmt.Errorf("development container has been removed")
 
 	// ErrDivertNotSupported raised if the divert feature is not supported in the current cluster
-	ErrDivertNotSupported = fmt.Errorf("the 'divert' field is only supported in namespaces managed by Okteto")
+	ErrDivertNotSupported = fmt.Errorf("the 'divert' field is only supported in contexts that have Okteto installed")
 
-	// ContextIsNotOktetoCluster raised if the cluster connected is not managed by okteto
-	ErrContextIsNotOktetoCluster = fmt.Errorf("this command is only available on Okteto Cloud or Okteto Enterprise")
+	// ErrContextIsNotOktetoCluster raised if the cluster connected is not managed by okteto
+	ErrContextIsNotOktetoCluster = UserError{
+		E:    fmt.Errorf("this command is only available installing Okteto in your cluster"),
+		Hint: "Visit our docs to learn more about the Okteto Platform:\n    https://www.okteto.com/docs",
+	}
 
-	// ErrTokenFlagNeeded is raised when the command is executed from inside a pod
+	// ErrTokenFlagNeeded is raised when the command is executed from inside a pod from a ctx command
 	ErrTokenFlagNeeded = fmt.Errorf("this command is not supported without the '--token' flag from inside a container")
 
-	// ErrNamespaceNotFound is raised when the namespace is not found on an okteto instance
-	ErrNamespaceNotFound = "namespace '%s' not found. Please verify that the namespace exists and that you have access to it"
+	// ErrTokenEnvVarNeeded is raised when the command is executed from inside a pod from a non ctx command
+	ErrTokenEnvVarNeeded = fmt.Errorf("the 'OKTETO_TOKEN' environment variable is required when running this command from within a container")
 
 	// ErrKubernetesContextNotFound is raised when the kubernetes context is not found in kubeconfig
 	ErrKubernetesContextNotFound = "context '%s' not found in '%s'"
@@ -123,7 +143,7 @@ var (
 	// ErrCorruptedOktetoContexts raised when the okteto context store is corrupted
 	ErrCorruptedOktetoContexts = "okteto context store is corrupted. Delete the folder '%s' and try again"
 
-	// ErrIntSig raised if the we get an interrupt signal in the middle of a command
+	// ErrIntSig raised if we get an interrupt signal in the middle of a command
 	ErrIntSig = fmt.Errorf("interrupt signal received")
 
 	// ErrKubernetesLongTimeToCreateDevContainer raised when the creation of the dev container times out
@@ -132,17 +152,8 @@ var (
 	// ErrNoServicesinOktetoManifest raised when no services are defined in the okteto manifest
 	ErrNoServicesinOktetoManifest = fmt.Errorf("'okteto restart' is only supported when using the field 'services'")
 
-	// ErrManifestFoundButNoDeployCommands raised when a manifest is found but no deploy commands are defined
-	ErrManifestFoundButNoDeployCommands = errors.New("found okteto manifest, but no deploy commands where defined")
-
-	// ErrDeployCantDeploySvcsIfNotCompose raised when a manifest is found but no compose info is detected and args are passed to deploy command
-	ErrDeployCantDeploySvcsIfNotCompose = errors.New("services args are can only be used while trying to deploy a compose")
-
-	// ErrUserAnsweredNoToCreateFromCompose raised when the user has selected a compose file but is trying to deploy without it
-	ErrUserAnsweredNoToCreateFromCompose = fmt.Errorf("user does not want to create from compose")
-
-	// ErrDeployHasFailedCommand raised when a deploy command is executed and fails
-	ErrDeployHasFailedCommand = errors.New("one of the commands in the 'deploy' section of your okteto manifests failed")
+	// ErrManifestFoundButNoDeployAndDependenciesCommands raised when a manifest is found but no deploy or dependencies commands are defined
+	ErrManifestFoundButNoDeployAndDependenciesCommands = errors.New("found okteto manifest, but no deploy or dependencies commands were defined")
 
 	// ErrGitHubNotVerifiedEmail is raised when github login has not a verified email
 	ErrGitHubNotVerifiedEmail = errors.New("github-not-verified-email")
@@ -157,19 +168,59 @@ var (
 	ErrNoFlagAllowedOnSingleImageBuild = errors.New("flags only allowed when building a single image with `okteto build [NAME]`")
 
 	// ErrManifestNoDevSection is raised when the manifest doesn't have a dev section and the user tries to access it
-	ErrManifestNoDevSection = errors.New("okteto manifest has no 'dev' section. Configure it with 'okteto init'")
+	ErrManifestNoDevSection = UserError{
+		E:    fmt.Errorf("your Okteto Manifest doesn't have a 'dev' section"),
+		Hint: "To learn more visit: https://www.okteto.com/docs/get-started/deploy-your-app",
+	}
 
 	// ErrDevContainerNotExists is raised when the dev container doesn't exist on dev section
 	ErrDevContainerNotExists = "development container '%s' doesn't exist"
 
-	//ErrInvalidManifest is raised when cannot unmarshal manifest properly
-	ErrInvalidManifest = errors.New("invalid manifest")
+	// ErrInvalidManifest is raised when cannot unmarshal manifest properly
+	ErrInvalidManifest = errors.New("your Okteto Manifest is not valid, please check the following errors")
 
-	//ErrEmptyManifest is raised when cannot detected content to read in manifest
+	// ErrServiceEmpty is raised whenever service is empty in docker-compose
+	ErrServiceEmpty = errors.New("service cannot be empty")
+
+	// ErrEmptyManifest is raised when cannot detected content to read in manifest
 	ErrEmptyManifest = errors.New("no content detected for okteto.yml file")
 
-	//ErrNotManifestContentDetected is raised when cannot load any field accepted by okteto manifest doc
+	// ErrPortAlreadyAllocated is raised when port is allocated by other process
+	ErrPortAlreadyAllocated = errors.New("port is already allocated")
+
+	// ErrNotManifestContentDetected is raised when cannot load any field accepted by okteto manifest doc
 	ErrNotManifestContentDetected = errors.New("couldn't detect okteto manifest content")
+
+	// ErrCouldNotInferAnyManifest is raised when we can't detect any manifest to load
+	ErrCouldNotInferAnyManifest = errors.New("couldn't detect any manifest (okteto manifest, pipeline or compose)")
+
+	// ErrX509Hint should be included within a UserError.Hint when IsX509() return true
+	ErrX509Hint = "Add the flag '--insecure-skip-tls-verify' to skip certificate verification.\n    Follow this link to know more about configuring your own certificates with Okteto:\n    https://www.okteto.com/docs/self-hosted/install/certificates/"
+
+	// ErrTimeout is raised when an operation has timed out
+	ErrTimeout = fmt.Errorf("operation timed out")
+
+	// ErrInvalidLicense is the error returned to the user when a trial is invalid.
+	// This can be either an expired trial license or no license at all
+	ErrInvalidLicense = errors.New("Your license is invalid")
+
+	// ErrTokenExpired is raised when token used for API auth is expired
+	ErrTokenExpired = errors.New("your token has expired")
+
+	// ErrNamespaceNotFound is raised when the get namespace query returns a namespace not found
+	ErrNamespaceNotFound = errors.New("namespace-not-found")
+
+	ErrManifestPathNotFound = UserError{
+		E:    fmt.Errorf("the Okteto manifest specified does not exist"),
+		Hint: "Check the path to the Okteto manifest file",
+	}
+	ErrManifestPathIsDir = UserError{
+		E:    fmt.Errorf("the Okteto manifest specified is a directory, please specify a file"),
+		Hint: "Check the path to the Okteto manifest file",
+	}
+
+	ErrReadinessProbeFailed = errors.New("readiness probe failed")
+	ErrLivenessProbeFailed  = errors.New("liveness probe failed")
 )
 
 // IsForbidden raised if the Okteto API returns 401
@@ -177,24 +228,14 @@ func IsForbidden(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "unauthorized")
 }
 
+// IsX509 raised if the Okteto API returns an error which contains x509
+func IsX509(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "x509")
+}
+
 // IsNotFound returns true if err is of the type not found
 func IsNotFound(err error) bool {
 	return err != nil && (strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "doesn't exist") || strings.Contains(err.Error(), "not-found"))
-}
-
-// IsNotExist returns true if err is of the type does not exist
-func IsNotExist(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	switch {
-	case strings.Contains(err.Error(), "does not exist"),
-		strings.Contains(err.Error(), "doesn't exist"):
-		return true
-	default:
-		return false
-	}
 }
 
 // IsTransient returns true if err represents a transient error
@@ -223,7 +264,12 @@ func IsTransient(err error) bool {
 		strings.Contains(err.Error(), "No connection could be made"),
 		strings.Contains(err.Error(), "operation was canceled"),
 		strings.Contains(err.Error(), "network is unreachable"),
-		strings.Contains(err.Error(), "development container has been removed"):
+		strings.Contains(err.Error(), "development container has been removed"),
+		strings.Contains(err.Error(), "unexpected packet in response to channel open"),
+		strings.Contains(err.Error(), "closing remote connection: EOF"),
+		strings.Contains(err.Error(), "request for pseudo terminal failed: eof"),
+		strings.Contains(err.Error(), "unable to upgrade connection"),
+		strings.Contains(err.Error(), "command execution failed: eof"):
 		return true
 	default:
 		return false

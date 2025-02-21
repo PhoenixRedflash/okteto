@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -36,10 +36,7 @@ func Update(ctx context.Context, job *batchv1.Job, c kubernetes.Interface) error
 	if err := Destroy(ctx, job.Name, job.Namespace, c); err != nil {
 		return err
 	}
-	if err := Create(ctx, job, c); err != nil {
-		return err
-	}
-	return nil
+	return Create(ctx, job, c)
 }
 
 func List(ctx context.Context, namespace, labels string, c kubernetes.Interface) ([]batchv1.Job, error) {
@@ -63,7 +60,7 @@ func Destroy(ctx context.Context, name, namespace string, c kubernetes.Interface
 		if oktetoErrors.IsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("error deleting kubernetes job: %s", err)
+		return fmt.Errorf("error deleting kubernetes job: %w", err)
 	}
 	oktetoLog.Infof("job '%s' deleted", name)
 	return nil

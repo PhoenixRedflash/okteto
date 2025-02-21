@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/fatih/color"
@@ -59,23 +60,24 @@ var (
 	WarningLevel = "warn"
 	// ErrorLevel is the json level for error
 	ErrorLevel = "error"
-
+	// DebugLevel is the json level for debug
 	DebugLevel = "debug"
 )
 
 type logger struct {
+	writer OktetoWriter
 	out    *logrus.Logger
 	file   *logrus.Entry
-	writer OktetoWriter
+
+	buf      *bytes.Buffer
+	replacer *strings.Replacer
+	spinner  *spinnerLogger
 
 	stage      string
 	outputMode string
 
-	buf *bytes.Buffer
-
 	maskedWords []string
 	isMasked    bool
-	replacer    *strings.Replacer
 }
 
 var log = &logger{
@@ -96,9 +98,13 @@ func Init(level logrus.Level) {
 	log.writer = log.getWriter(TTYFormat)
 	log.maskedWords = []string{}
 	log.buf = &bytes.Buffer{}
+	log.spinner = &spinnerLogger{
+		sp:             newSpinner(),
+		spinnerSupport: !loadBool(OktetoDisableSpinnerEnvVar) && IsInteractive(),
+	}
 }
 
-//ConfigureFileLogger configures the file to write
+// ConfigureFileLogger configures the file to write
 func ConfigureFileLogger(dir, version string) {
 	fileLogger := logrus.New()
 	fileLogger.SetFormatter(&logrus.TextFormatter{
@@ -120,7 +126,7 @@ func getRollingLog(path string) io.Writer {
 		Filename:   path,
 		MaxSize:    1, // megabytes
 		MaxBackups: 10,
-		MaxAge:     28, //days
+		MaxAge:     28, // days
 		Compress:   true,
 	}
 }
@@ -157,6 +163,7 @@ func SetOutput(output io.Writer) {
 // SetOutputFormat sets the output format
 func SetOutputFormat(format string) {
 	log.writer = log.getWriter(format)
+	log.spinner.spinnerSupport = !loadBool(OktetoDisableSpinnerEnvVar) && IsInteractive()
 }
 
 // GetOutputWriter sets the output format
@@ -299,15 +306,30 @@ func Printf(format string, args ...interface{}) {
 	log.writer.Print(msg)
 }
 
-//IsInteractive checks if the writer is interactive
+// IsInteractive checks if the writer is interactive
 func IsInteractive() bool {
 	return log.writer.IsInteractive()
 }
 
-// AddMaskedWord adds a new
+// AddMaskedWord adds a new word to be redacted, only if longer than 5 chars
 func AddMaskedWord(word string) {
-	if strings.TrimSpace(word) != "" {
-		log.maskedWords = append(log.maskedWords, word)
+	clean := strings.TrimSpace(word)
+
+	// only mask words longer than 5 chars (i.e. 'true' and 'false' won't be masked)
+	minCharsToMask := 5
+	if len(clean) <= minCharsToMask {
+		return
+	}
+	log.maskedWords = append(log.maskedWords, clean)
+
+	crossPlatformCleanWord := strings.ReplaceAll(clean, "\r\n", "\n")
+	lines := strings.Split(crossPlatformCleanWord, "\n")
+	for _, line := range lines {
+		cleanLine := strings.TrimSpace(line)
+		if len(cleanLine) <= minCharsToMask {
+			continue
+		}
+		log.maskedWords = append(log.maskedWords, cleanLine)
 	}
 }
 
@@ -337,7 +359,7 @@ func redactMessage(message string) string {
 	return message
 }
 
-//GetOutputBuffer returns the buffer of the running command
+// GetOutputBuffer returns the buffer of the running command
 func GetOutputBuffer() *bytes.Buffer {
 	return log.buf
 }
@@ -345,4 +367,16 @@ func GetOutputBuffer() *bytes.Buffer {
 // AddToBuffer logs into the buffer but does not print anything
 func AddToBuffer(level, format string, args ...interface{}) {
 	log.writer.AddToBuffer(level, format, args...)
+}
+
+func loadBool(env string) bool {
+	value := os.Getenv(env)
+	if value == "" {
+		value = "false"
+	}
+	boolValue, err := strconv.ParseBool(value)
+	if err != nil {
+		Yellow("'%s' is not a valid value for environment variable %s", value, env)
+	}
+	return boolValue
 }

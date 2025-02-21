@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,6 @@ import (
 	"log"
 
 	"k8s.io/client-go/rest"
-
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
@@ -28,12 +27,12 @@ func InCluster() bool {
 	return err == nil
 }
 
-//Create creates a new  kubeconfig file
+// Create creates a new  kubeconfig file
 func Create() *clientcmdapi.Config {
 	return clientcmdapi.NewConfig()
 }
 
-//Get retrieves a kubeconfig file
+// Get retrieves a kubeconfig file
 func Get(kubeconfigPaths []string) *clientcmdapi.Config {
 	loadingRules := clientcmd.ClientConfigLoadingRules{
 		Precedence: kubeconfigPaths,
@@ -45,7 +44,7 @@ func Get(kubeconfigPaths []string) *clientcmdapi.Config {
 	return mergedConfig
 }
 
-//Write stores a kubeconfig file
+// Write stores a kubeconfig file
 func Write(cfg *clientcmdapi.Config, kubeconfigPath string) error {
 	return clientcmd.WriteToFile(*cfg, kubeconfigPath)
 }

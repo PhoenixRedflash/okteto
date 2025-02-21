@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,9 +21,8 @@ import (
 	oktetoLog "github.com/okteto/okteto/pkg/log"
 	networkingv1 "k8s.io/api/networking/v1"
 	networkingv1beta1 "k8s.io/api/networking/v1beta1"
-	"k8s.io/client-go/kubernetes"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 type Client struct {
@@ -43,7 +42,7 @@ type Ingress struct {
 	V1Beta1 *networkingv1beta1.Ingress
 }
 
-func GetClient(ctx context.Context, c kubernetes.Interface) (*Client, error) {
+func GetClient(c kubernetes.Interface) (*Client, error) {
 	rList, err := c.Discovery().ServerResourcesForGroupVersion("networking.k8s.io/v1")
 	if err != nil {
 		return nil, err
@@ -57,7 +56,7 @@ func GetClient(ctx context.Context, c kubernetes.Interface) (*Client, error) {
 	return NewIngressClient(c, false), nil
 }
 
-//Get results the ingress
+// Get results the ingress
 func (iClient *Client) Get(ctx context.Context, name, namespace string) (metav1.Object, error) {
 	if iClient.isV1 {
 		i, err := iClient.c.NetworkingV1().Ingresses(namespace).Get(ctx, name, metav1.GetOptions{})
@@ -83,7 +82,7 @@ func (iClient *Client) Create(ctx context.Context, i *Ingress) error {
 	return err
 }
 
-//Update updates a statefulset
+// Update updates a statefulset
 func (iClient *Client) Update(ctx context.Context, i *Ingress) error {
 	if iClient.isV1 {
 		_, err := iClient.c.NetworkingV1().Ingresses(i.V1.Namespace).Update(ctx, i.V1, metav1.UpdateOptions{})
@@ -93,7 +92,7 @@ func (iClient *Client) Update(ctx context.Context, i *Ingress) error {
 	return err
 }
 
-//List returns the list of deployments
+// List returns the list of deployments
 func (iClient *Client) List(ctx context.Context, namespace, labels string) ([]metav1.Object, error) {
 	result := []metav1.Object{}
 	if iClient.isV1 {
@@ -117,20 +116,20 @@ func (iClient *Client) List(ctx context.Context, namespace, labels string) ([]me
 	return result, nil
 }
 
-//Destroy destroys a k8s deployment
+// Destroy destroys a k8s deployment
 func (iClient *Client) Destroy(ctx context.Context, name, namespace string) error {
 	oktetoLog.Infof("deleting ingress '%s'", name)
 	if iClient.isV1 {
 		err := iClient.c.NetworkingV1().Ingresses(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 		if err != nil && !oktetoErrors.IsNotFound(err) {
-			return fmt.Errorf("error deleting kubernetes ingress: %s", err)
+			return fmt.Errorf("error deleting kubernetes ingress: %w", err)
 		}
 		return nil
 	}
 
 	err := iClient.c.NetworkingV1beta1().Ingresses(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil && !oktetoErrors.IsNotFound(err) {
-		return fmt.Errorf("error deleting kubernetes ingress: %s", err)
+		return fmt.Errorf("error deleting kubernetes ingress: %w", err)
 	}
 	return nil
 }
@@ -191,4 +190,32 @@ func (i Ingress) GetLabels() map[string]string {
 		return i.V1.Labels
 	}
 	return i.V1Beta1.Labels
+}
+
+// GetAnnotations gets the annotations of the ingress
+func (i Ingress) GetAnnotations() map[string]string {
+	if i.V1 != nil {
+		return i.V1.Annotations
+	}
+	return i.V1Beta1.Annotations
+}
+
+// Deploy creates or updates an ingress
+func (iClient *Client) Deploy(ctx context.Context, ingress *Ingress) error {
+	if _, err := iClient.Get(ctx, ingress.GetName(), ingress.GetNamespace()); err != nil {
+		if !oktetoErrors.IsNotFound(err) {
+			return fmt.Errorf("error getting ingress '%s': %w", ingress.GetName(), err)
+		}
+		if err := iClient.Create(ctx, ingress); err != nil {
+			return err
+		}
+		oktetoLog.Success("Endpoint '%s' created", ingress.GetName())
+		return nil
+	}
+
+	if err := iClient.Update(ctx, ingress); err != nil {
+		return err
+	}
+	oktetoLog.Success("Endpoint '%s' updated", ingress.GetName())
+	return nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2022 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,25 +17,28 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 
 	buildv2 "github.com/okteto/okteto/cmd/build/v2"
 	"github.com/okteto/okteto/cmd/utils"
-	"github.com/okteto/okteto/pkg/k8s/ingresses"
+	"github.com/okteto/okteto/pkg/build"
+	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/env"
+	"github.com/okteto/okteto/pkg/format"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/log/io"
 	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/types"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	apiv1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
-	networkingv1beta1 "k8s.io/api/networking/v1beta1"
-
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -51,11 +54,33 @@ const (
 	destroyingStatus  = "destroying"
 
 	pvcName = "pvc"
+
+	// oktetoComposeVolumeAffinityEnabledEnvVar represents whether the feature flag to enable volume affinity is enabled or not
+	oktetoComposeVolumeAffinityEnabledEnvVar = "OKTETO_COMPOSE_VOLUME_AFFINITY_ENABLED"
 )
 
-func buildStackImages(ctx context.Context, s *model.Stack, options *StackDeployOptions) error {
+// +enum
+type updateStrategy string
+
+const (
+	// rollingUpdateStrategy represent a rolling update strategy
+	rollingUpdateStrategy updateStrategy = "rolling"
+
+	// recreateUpdateStrategy represents a recreate update strategy
+	recreateUpdateStrategy updateStrategy = "recreate"
+
+	// onDeleteUpdateStrategy represents a recreate update strategy
+	onDeleteUpdateStrategy updateStrategy = "on-delete"
+)
+
+func buildStackImages(ctx context.Context, s *model.Stack, options *DeployOptions, analyticsTracker, insights buildTrackerInterface, ioCtrl *io.Controller) error {
 	manifest := model.NewManifestFromStack(s)
-	builder := buildv2.NewBuilderFromScratch()
+
+	onBuildFinish := []buildv2.OnBuildFinish{
+		analyticsTracker.TrackImageBuild,
+		insights.TrackImageBuild,
+	}
+	builder := buildv2.NewBuilderFromScratch(ioCtrl, onBuildFinish)
 	if options.ForceBuild {
 		buildOptions := &types.BuildOptions{
 			Manifest:    manifest,
@@ -65,7 +90,7 @@ func buildStackImages(ctx context.Context, s *model.Stack, options *StackDeployO
 			return err
 		}
 	} else {
-		svcsToBuild, err := builder.GetServicesToBuild(ctx, manifest, options.ServicesToDeploy)
+		svcsToBuild, err := builder.GetServicesToBuildDuringExecution(ctx, manifest, options.ServicesToDeploy)
 		if err != nil {
 			return err
 		}
@@ -89,7 +114,8 @@ func translateConfigMap(s *model.Stack) *apiv1.ConfigMap {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: model.GetStackConfigMapName(s.Name),
 			Labels: map[string]string{
-				model.StackLabel: "true",
+				model.StackLabel:      "true",
+				model.DeployedByLabel: format.ResourceK8sMetaString(s.Name),
 			},
 		},
 		Data: map[string]string{
@@ -100,10 +126,35 @@ func translateConfigMap(s *model.Stack) *apiv1.ConfigMap {
 	}
 }
 
-func translateDeployment(svcName string, s *model.Stack) *appsv1.Deployment {
+func translateDeployment(svcName string, s *model.Stack, divert Divert) *appsv1.Deployment {
 	svc := s.Services[svcName]
 
-	healthcheckProbe := getSvcProbe(svc)
+	svcHealthchecks := getSvcHealthProbe(svc)
+
+	podSpec := apiv1.PodSpec{
+		TerminationGracePeriodSeconds: ptr.To(svc.StopGracePeriod),
+		NodeSelector:                  svc.NodeSelector,
+		Containers: []apiv1.Container{
+			{
+				Name:            svcName,
+				Image:           svc.Image,
+				Command:         svc.Entrypoint.Values,
+				Args:            svc.Command.Values,
+				Env:             translateServiceEnvironment(svc),
+				Ports:           translateContainerPorts(svc),
+				SecurityContext: translateSecurityContext(svc),
+				Resources:       translateResources(svc),
+				WorkingDir:      svc.Workdir,
+				ReadinessProbe:  svcHealthchecks.readiness,
+				LivenessProbe:   svcHealthchecks.liveness,
+			},
+		},
+	}
+
+	if divert != nil {
+		podSpec = divert.UpdatePod(podSpec)
+	}
+
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        svcName,
@@ -112,35 +163,17 @@ func translateDeployment(svcName string, s *model.Stack) *appsv1.Deployment {
 			Annotations: translateAnnotations(svc),
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: pointer.Int32Ptr(svc.Replicas),
+			Replicas: ptr.To(svc.Replicas),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: translateLabelSelector(svcName, s),
 			},
-			Strategy: appsv1.DeploymentStrategy{
-				Type: appsv1.RecreateDeploymentStrategyType,
-			},
+			Strategy: getDeploymentUpdateStrategy(svc),
 			Template: apiv1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      translateLabels(svcName, s),
 					Annotations: translateAnnotations(svc),
 				},
-				Spec: apiv1.PodSpec{
-					TerminationGracePeriodSeconds: pointer.Int64Ptr(svc.StopGracePeriod),
-					Containers: []apiv1.Container{
-						{
-							Name:            svcName,
-							Image:           svc.Image,
-							Command:         svc.Entrypoint.Values,
-							Args:            svc.Command.Values,
-							Env:             translateServiceEnvironment(svc),
-							Ports:           translateContainerPorts(svc),
-							SecurityContext: translateSecurityContext(svc),
-							Resources:       translateResources(svc),
-							WorkingDir:      svc.Workdir,
-							ReadinessProbe:  healthcheckProbe,
-						},
-					},
-				},
+				Spec: podSpec,
 			},
 		},
 	}
@@ -158,7 +191,7 @@ func translatePersistentVolumeClaim(volumeName string, s *model.Stack) apiv1.Per
 		},
 		Spec: apiv1.PersistentVolumeClaimSpec{
 			AccessModes: []apiv1.PersistentVolumeAccessMode{apiv1.ReadWriteOnce},
-			Resources: apiv1.ResourceRequirements{
+			Resources: apiv1.VolumeResourceRequirements{
 				Requests: apiv1.ResourceList{
 					"storage": volumeSpec.Size.Value,
 				},
@@ -169,11 +202,40 @@ func translatePersistentVolumeClaim(volumeName string, s *model.Stack) apiv1.Per
 	return pvc
 }
 
-func translateStatefulSet(svcName string, s *model.Stack) *appsv1.StatefulSet {
+func translateStatefulSet(svcName string, s *model.Stack, divert Divert) *appsv1.StatefulSet {
 	svc := s.Services[svcName]
 
 	initContainers := getInitContainers(svcName, s)
-	healthcheckProbe := getSvcProbe(svc)
+	svcHealthchecks := getSvcHealthProbe(svc)
+
+	podSpec := apiv1.PodSpec{
+		TerminationGracePeriodSeconds: ptr.To(svc.StopGracePeriod),
+		InitContainers:                initContainers,
+		Affinity:                      translateAffinity(svc),
+		NodeSelector:                  svc.NodeSelector,
+		Volumes:                       translateVolumes(svc),
+		Containers: []apiv1.Container{
+			{
+				Name:            svcName,
+				Image:           svc.Image,
+				Command:         svc.Entrypoint.Values,
+				Args:            svc.Command.Values,
+				Env:             translateServiceEnvironment(svc),
+				Ports:           translateContainerPorts(svc),
+				SecurityContext: translateSecurityContext(svc),
+				VolumeMounts:    translateVolumeMounts(svc),
+				Resources:       translateResources(svc),
+				WorkingDir:      svc.Workdir,
+				ReadinessProbe:  svcHealthchecks.readiness,
+				LivenessProbe:   svcHealthchecks.liveness,
+			},
+		},
+	}
+
+	if divert != nil {
+		podSpec = divert.UpdatePod(podSpec)
+	}
+
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        svcName,
@@ -182,49 +244,59 @@ func translateStatefulSet(svcName string, s *model.Stack) *appsv1.StatefulSet {
 			Annotations: translateAnnotations(svc),
 		},
 		Spec: appsv1.StatefulSetSpec{
-			Replicas:             pointer.Int32Ptr(svc.Replicas),
-			RevisionHistoryLimit: pointer.Int32Ptr(2),
+			Replicas:             ptr.To(svc.Replicas),
+			RevisionHistoryLimit: ptr.To(int32(2)),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: translateLabelSelector(svcName, s),
 			},
-			ServiceName: svcName,
+			UpdateStrategy: getStatefulsetUpdateStrategy(svc),
+			ServiceName:    svcName,
 			Template: apiv1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      translateLabels(svcName, s),
 					Annotations: translateAnnotations(svc),
 				},
-				Spec: apiv1.PodSpec{
-					TerminationGracePeriodSeconds: pointer.Int64Ptr(svc.StopGracePeriod),
-					InitContainers:                initContainers,
-					Affinity:                      translateAffinity(svc),
-					Volumes:                       translateVolumes(svc),
-					Containers: []apiv1.Container{
-						{
-							Name:            svcName,
-							Image:           svc.Image,
-							Command:         svc.Entrypoint.Values,
-							Args:            svc.Command.Values,
-							Env:             translateServiceEnvironment(svc),
-							Ports:           translateContainerPorts(svc),
-							SecurityContext: translateSecurityContext(svc),
-							VolumeMounts:    translateVolumeMounts(svc),
-							Resources:       translateResources(svc),
-							WorkingDir:      svc.Workdir,
-							ReadinessProbe:  healthcheckProbe,
-						},
-					},
-				},
+				Spec: podSpec,
 			},
 			VolumeClaimTemplates: translateVolumeClaimTemplates(svcName, s),
 		},
 	}
 }
 
-func translateJob(svcName string, s *model.Stack) *batchv1.Job {
+func translateJob(svcName string, s *model.Stack, divert Divert) *batchv1.Job {
 	svc := s.Services[svcName]
 
 	initContainers := getInitContainers(svcName, s)
-	healthcheckProbe := getSvcProbe(svc)
+	svcHealthchecks := getSvcHealthProbe(svc)
+	podSpec := apiv1.PodSpec{
+		RestartPolicy:                 svc.RestartPolicy,
+		TerminationGracePeriodSeconds: ptr.To(svc.StopGracePeriod),
+		InitContainers:                initContainers,
+		Affinity:                      translateAffinity(svc),
+		NodeSelector:                  svc.NodeSelector,
+		Containers: []apiv1.Container{
+			{
+				Name:            svcName,
+				Image:           svc.Image,
+				Command:         svc.Entrypoint.Values,
+				Args:            svc.Command.Values,
+				Env:             translateServiceEnvironment(svc),
+				Ports:           translateContainerPorts(svc),
+				SecurityContext: translateSecurityContext(svc),
+				VolumeMounts:    translateVolumeMounts(svc),
+				Resources:       translateResources(svc),
+				WorkingDir:      svc.Workdir,
+				ReadinessProbe:  svcHealthchecks.readiness,
+				LivenessProbe:   svcHealthchecks.liveness,
+			},
+		},
+		Volumes: translateVolumes(svc),
+	}
+
+	if divert != nil {
+		podSpec = divert.UpdatePod(podSpec)
+	}
+
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        svcName,
@@ -233,36 +305,15 @@ func translateJob(svcName string, s *model.Stack) *batchv1.Job {
 			Annotations: translateAnnotations(svc),
 		},
 		Spec: batchv1.JobSpec{
-			Completions:  pointer.Int32Ptr(svc.Replicas),
-			Parallelism:  pointer.Int32Ptr(1),
+			Completions:  ptr.To(svc.Replicas),
+			Parallelism:  ptr.To(int32(1)),
 			BackoffLimit: &svc.BackOffLimit,
 			Template: apiv1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      translateLabels(svcName, s),
 					Annotations: translateAnnotations(svc),
 				},
-				Spec: apiv1.PodSpec{
-					RestartPolicy:                 svc.RestartPolicy,
-					TerminationGracePeriodSeconds: pointer.Int64Ptr(svc.StopGracePeriod),
-					InitContainers:                initContainers,
-					Affinity:                      translateAffinity(svc),
-					Containers: []apiv1.Container{
-						{
-							Name:            svcName,
-							Image:           svc.Image,
-							Command:         svc.Entrypoint.Values,
-							Args:            svc.Command.Values,
-							Env:             translateServiceEnvironment(svc),
-							Ports:           translateContainerPorts(svc),
-							SecurityContext: translateSecurityContext(svc),
-							VolumeMounts:    translateVolumeMounts(svc),
-							Resources:       translateResources(svc),
-							WorkingDir:      svc.Workdir,
-							ReadinessProbe:  healthcheckProbe,
-						},
-					},
-					Volumes: translateVolumes(svc),
-				},
+				Spec: podSpec,
 			},
 		},
 	}
@@ -287,10 +338,11 @@ func getInitContainers(svcName string, s *model.Stack) []apiv1.Container {
 func getAddPermissionsInitContainer(svcName string, svc *model.Service) apiv1.Container {
 	initContainerCommand, initContainerVolumeMounts := getInitContainerCommandAndVolumeMounts(*svc)
 	initContainer := apiv1.Container{
-		Name:         fmt.Sprintf("init-%s", svcName),
-		Image:        "busybox",
-		Command:      initContainerCommand,
-		VolumeMounts: initContainerVolumeMounts,
+		Name:            fmt.Sprintf("init-%s", svcName),
+		Image:           config.NewImageConfig(oktetoLog.GetOutputWriter()).GetOktetoImage(),
+		ImagePullPolicy: apiv1.PullIfNotPresent,
+		Command:         initContainerCommand,
+		VolumeMounts:    initContainerVolumeMounts,
 	}
 	return initContainer
 }
@@ -368,7 +420,7 @@ func translateVolumeClaimTemplates(svcName string, s *model.Stack) []apiv1.Persi
 					},
 					Spec: apiv1.PersistentVolumeClaimSpec{
 						AccessModes: []apiv1.PersistentVolumeAccessMode{apiv1.ReadWriteOnce},
-						Resources: apiv1.ResourceRequirements{
+						Resources: apiv1.VolumeResourceRequirements{
 							Requests: apiv1.ResourceList{
 								"storage": svc.Resources.Requests.Storage.Size.Value,
 							},
@@ -427,210 +479,12 @@ func getSvcPublicPorts(svcName string, s *model.Stack) []model.Port {
 	return result
 }
 
-func translateSvcIngress(ingressName, svcIngress string, svcPort int32, s *model.Stack) *ingresses.Ingress {
-	return &ingresses.Ingress{
-		V1:      translateServiceIngressV1(ingressName, svcIngress, svcPort, s),
-		V1Beta1: translateServiceIngressV1Beta1(ingressName, svcIngress, svcPort, s),
-	}
-}
-
-func translateServiceIngressV1(ingressName, svcIngress string, svcPort int32, s *model.Stack) *networkingv1.Ingress {
-	pathType := networkingv1.PathTypeImplementationSpecific
-	return &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        ingressName,
-			Namespace:   s.Namespace,
-			Labels:      translateServiceIngressLabels(svcIngress, s),
-			Annotations: translateServiceIngressAnnotations(svcIngress, s),
-		},
-		Spec: networkingv1.IngressSpec{
-			Rules: []networkingv1.IngressRule{
-				{
-					IngressRuleValue: networkingv1.IngressRuleValue{
-						HTTP: &networkingv1.HTTPIngressRuleValue{
-							Paths: []networkingv1.HTTPIngressPath{
-								{
-									Path:     "/",
-									PathType: &pathType,
-									Backend: networkingv1.IngressBackend{
-										Service: &networkingv1.IngressServiceBackend{
-											Name: svcIngress,
-											Port: networkingv1.ServiceBackendPort{
-												Number: svcPort,
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-}
-
-func translateServiceIngressV1Beta1(ingressName, svcIngress string, svcPort int32, s *model.Stack) *networkingv1beta1.Ingress {
-	return &networkingv1beta1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        ingressName,
-			Namespace:   s.Namespace,
-			Labels:      translateServiceIngressLabels(svcIngress, s),
-			Annotations: translateServiceIngressAnnotations(svcIngress, s),
-		},
-		Spec: networkingv1beta1.IngressSpec{
-			Rules: []networkingv1beta1.IngressRule{
-				{
-					IngressRuleValue: networkingv1beta1.IngressRuleValue{
-						HTTP: &networkingv1beta1.HTTPIngressRuleValue{
-							Paths: []networkingv1beta1.HTTPIngressPath{
-								{
-									Path: "/",
-									Backend: networkingv1beta1.IngressBackend{
-										ServiceName: svcIngress,
-										ServicePort: intstr.IntOrString{IntVal: svcPort},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func translateServiceIngressAnnotations(svcName string, s *model.Stack) map[string]string {
-	svc := s.Services[svcName]
-	annotations := model.Annotations{model.OktetoIngressAutoGenerateHost: "true"}
-	if svc.Annotations != nil {
-		for k := range svc.Annotations {
-			annotations[k] = svc.Annotations[k]
-		}
-	}
-	return annotations
-}
-
-func translateServiceIngressLabels(svcName string, s *model.Stack) map[string]string {
-	svc := s.Services[svcName]
-	labels := map[string]string{
-		model.StackNameLabel: s.Name,
-	}
-	for k := range svc.Labels {
-		labels[k] = svc.Labels[k]
-	}
-
-	return labels
-}
-func translateEndpointIngressV1(ingressName string, s *model.Stack) *networkingv1.Ingress {
-	endpoints := s.Endpoints[ingressName]
-	return &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        ingressName,
-			Namespace:   s.Namespace,
-			Labels:      translateEndpointIngressLabels(ingressName, s),
-			Annotations: translateEndpointIngressAnnotations(ingressName, s),
-		},
-		Spec: networkingv1.IngressSpec{
-			Rules: []networkingv1.IngressRule{
-				{
-					IngressRuleValue: networkingv1.IngressRuleValue{
-						HTTP: &networkingv1.HTTPIngressRuleValue{
-							Paths: translateEndpointsV1(endpoints),
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func translateEndpointIngressV1Beta1(ingressName string, s *model.Stack) *networkingv1beta1.Ingress {
-	endpoints := s.Endpoints[ingressName]
-	return &networkingv1beta1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        ingressName,
-			Namespace:   s.Namespace,
-			Labels:      translateEndpointIngressLabels(ingressName, s),
-			Annotations: translateEndpointIngressAnnotations(ingressName, s),
-		},
-		Spec: networkingv1beta1.IngressSpec{
-			Rules: []networkingv1beta1.IngressRule{
-				{
-					IngressRuleValue: networkingv1beta1.IngressRuleValue{
-						HTTP: &networkingv1beta1.HTTPIngressRuleValue{
-							Paths: translateEndpointsV1Beta1(endpoints),
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func translateEndpointsV1(endpoints model.Endpoint) []networkingv1.HTTPIngressPath {
-	paths := make([]networkingv1.HTTPIngressPath, 0)
-	pathType := networkingv1.PathTypeImplementationSpecific
-	for _, rule := range endpoints.Rules {
-		path := networkingv1.HTTPIngressPath{
-			Path:     rule.Path,
-			PathType: &pathType,
-			Backend: networkingv1.IngressBackend{
-				Service: &networkingv1.IngressServiceBackend{
-					Name: rule.Service,
-					Port: networkingv1.ServiceBackendPort{
-						Number: rule.Port,
-					},
-				},
-			},
-		}
-		paths = append(paths, path)
-	}
-	return paths
-}
-
-func translateEndpointsV1Beta1(endpoints model.Endpoint) []networkingv1beta1.HTTPIngressPath {
-	paths := make([]networkingv1beta1.HTTPIngressPath, 0)
-	for _, rule := range endpoints.Rules {
-		path := networkingv1beta1.HTTPIngressPath{
-			Path: rule.Path,
-			Backend: networkingv1beta1.IngressBackend{
-				ServiceName: rule.Service,
-				ServicePort: intstr.IntOrString{IntVal: rule.Port},
-			},
-		}
-		paths = append(paths, path)
-	}
-	return paths
-}
-
-func translateEndpointIngressAnnotations(endpointName string, s *model.Stack) map[string]string {
-	endpoint := s.Endpoints[endpointName]
-	annotations := model.Annotations{model.OktetoIngressAutoGenerateHost: "true"}
-	for k := range endpoint.Annotations {
-		annotations[k] = endpoint.Annotations[k]
-	}
-	return annotations
-}
-
-func translateEndpointIngressLabels(endpointName string, s *model.Stack) map[string]string {
-	endpoint := s.Endpoints[endpointName]
-	labels := map[string]string{
-		model.StackNameLabel:         s.Name,
-		model.StackEndpointNameLabel: endpointName,
-	}
-	for k := range endpoint.Labels {
-		labels[k] = endpoint.Labels[k]
-	}
-	return labels
-}
-
 func translateVolumeLabels(volumeName string, s *model.Stack) map[string]string {
 	volume := s.Volumes[volumeName]
 	labels := map[string]string{
-		model.StackNameLabel:       s.Name,
+		model.StackNameLabel:       format.ResourceK8sMetaString(s.Name),
 		model.StackVolumeNameLabel: volumeName,
+		model.DeployedByLabel:      format.ResourceK8sMetaString(s.Name),
 	}
 	for k := range volume.Labels {
 		labels[k] = volume.Labels[k]
@@ -639,6 +493,10 @@ func translateVolumeLabels(volumeName string, s *model.Stack) map[string]string 
 }
 
 func translateAffinity(svc *model.Service) *apiv1.Affinity {
+	if !env.LoadBooleanOrDefault(oktetoComposeVolumeAffinityEnabledEnvVar, true) {
+		return nil
+	}
+
 	requirements := make([]apiv1.PodAffinityTerm, 0)
 	for _, volume := range svc.Volumes {
 		if volume.LocalPath == "" {
@@ -671,8 +529,9 @@ func translateAffinity(svc *model.Service) *apiv1.Affinity {
 func translateLabels(svcName string, s *model.Stack) map[string]string {
 	svc := s.Services[svcName]
 	labels := map[string]string{
-		model.StackNameLabel:        s.Name,
+		model.StackNameLabel:        format.ResourceK8sMetaString(s.Name),
 		model.StackServiceNameLabel: svcName,
+		model.DeployedByLabel:       format.ResourceK8sMetaString(s.Name),
 	}
 	for k := range svc.Labels {
 		labels[k] = svc.Labels[k]
@@ -688,14 +547,13 @@ func translateLabels(svcName string, s *model.Stack) map[string]string {
 
 func translateLabelSelector(svcName string, s *model.Stack) map[string]string {
 	labels := map[string]string{
-		model.StackNameLabel:        s.Name,
+		model.StackNameLabel:        format.ResourceK8sMetaString(s.Name),
 		model.StackServiceNameLabel: svcName,
 	}
 	return labels
 }
 
 func translateAnnotations(svc *model.Service) map[string]string {
-
 	result := getAnnotations()
 	for k, v := range svc.Annotations {
 		result[k] = v
@@ -709,13 +567,6 @@ func getAnnotations() map[string]string {
 		annotations[model.OktetoSampleAnnotation] = "true"
 	}
 	return annotations
-}
-
-func translateServiceType(svc model.Service) apiv1.ServiceType {
-	if svc.Public {
-		return apiv1.ServiceTypeLoadBalancer
-	}
-	return apiv1.ServiceTypeClusterIP
 }
 
 func translateVolumeMounts(svc *model.Service) []apiv1.VolumeMount {
@@ -739,7 +590,7 @@ func translateVolumeMounts(svc *model.Service) []apiv1.VolumeMount {
 	return result
 }
 
-func getVolumeClaimName(v *model.StackVolume) string {
+func getVolumeClaimName(v *build.VolumeMounts) string {
 	var name string
 	if v.LocalPath != "" {
 		name = v.LocalPath
@@ -803,7 +654,7 @@ func translateServicePorts(svc model.Service) []apiv1.ServicePort {
 				result,
 				apiv1.ServicePort{
 					Name:       fmt.Sprintf("p-%d-%d-%s", p.ContainerPort, p.ContainerPort, strings.ToLower(fmt.Sprintf("%v", p.Protocol))),
-					Port:       int32(p.ContainerPort),
+					Port:       p.ContainerPort,
 					TargetPort: intstr.IntOrString{IntVal: p.ContainerPort},
 					Protocol:   p.Protocol,
 				},
@@ -814,7 +665,7 @@ func translateServicePorts(svc model.Service) []apiv1.ServicePort {
 				result,
 				apiv1.ServicePort{
 					Name:       fmt.Sprintf("p-%d-%d-%s", p.HostPort, p.ContainerPort, strings.ToLower(fmt.Sprintf("%v", p.Protocol))),
-					Port:       int32(p.HostPort),
+					Port:       p.HostPort,
 					TargetPort: intstr.IntOrString{IntVal: p.ContainerPort},
 					Protocol:   p.Protocol,
 				},
@@ -855,14 +706,20 @@ func translateResources(svc *model.Service) apiv1.ResourceRequirements {
 		if svc.Resources.Requests.Memory.Value.Cmp(resource.MustParse("0")) > 0 {
 			if result.Requests == nil {
 				result.Requests = apiv1.ResourceList{}
-				result.Requests[apiv1.ResourceMemory] = svc.Resources.Requests.Memory.Value
 			}
+			result.Requests[apiv1.ResourceMemory] = svc.Resources.Requests.Memory.Value
 		}
 	}
 	return result
 }
 
-func getSvcProbe(svc *model.Service) *apiv1.Probe {
+type healthcheckProbes struct {
+	readiness *apiv1.Probe
+	liveness  *apiv1.Probe
+}
+
+func getSvcHealthProbe(svc *model.Service) healthcheckProbes {
+	result := healthcheckProbes{}
 	if svc.Healtcheck != nil {
 		var handler apiv1.ProbeHandler
 		if len(svc.Healtcheck.Test) != 0 {
@@ -879,13 +736,107 @@ func getSvcProbe(svc *model.Service) *apiv1.Probe {
 				},
 			}
 		}
-		return &apiv1.Probe{
+		probe := &apiv1.Probe{
 			ProbeHandler:        handler,
 			TimeoutSeconds:      int32(svc.Healtcheck.Timeout.Seconds()),
 			PeriodSeconds:       int32(svc.Healtcheck.Interval.Seconds()),
 			FailureThreshold:    int32(svc.Healtcheck.Retries),
 			InitialDelaySeconds: int32(svc.Healtcheck.StartPeriod.Seconds()),
 		}
+
+		if svc.Healtcheck.Readiness {
+			result.readiness = probe
+		}
+		if svc.Healtcheck.Liveness {
+			result.liveness = probe
+		}
+	}
+	return result
+}
+
+type updateStrategyGetter interface {
+	validate(updateStrategy) error
+	getDefault() updateStrategy
+}
+
+type deploymentStrategyGetter struct{}
+
+func (*deploymentStrategyGetter) validate(updateStrategy updateStrategy) error {
+	if updateStrategy != rollingUpdateStrategy && updateStrategy != recreateUpdateStrategy {
+		return fmt.Errorf("invalid deployment update strategy: '%s'", updateStrategy)
 	}
 	return nil
+}
+
+func (*deploymentStrategyGetter) getDefault() updateStrategy {
+	return recreateUpdateStrategy
+}
+
+type statefulSetStrategyGetter struct{}
+
+func (*statefulSetStrategyGetter) validate(updateStrategy updateStrategy) error {
+	if updateStrategy != rollingUpdateStrategy && updateStrategy != onDeleteUpdateStrategy {
+		return fmt.Errorf("invalid statefulset update strategy: '%s'", updateStrategy)
+	}
+	return nil
+}
+
+func (*statefulSetStrategyGetter) getDefault() updateStrategy {
+	return rollingUpdateStrategy
+}
+
+func getDeploymentUpdateStrategy(svc *model.Service) appsv1.DeploymentStrategy {
+	result := getUpdateStrategy(svc, &deploymentStrategyGetter{})
+	if result == rollingUpdateStrategy {
+		return appsv1.DeploymentStrategy{
+			Type: appsv1.RollingUpdateDeploymentStrategyType,
+		}
+	}
+	return appsv1.DeploymentStrategy{
+		Type: appsv1.RecreateDeploymentStrategyType,
+	}
+}
+
+func getStatefulsetUpdateStrategy(svc *model.Service) appsv1.StatefulSetUpdateStrategy {
+	result := getUpdateStrategy(svc, &statefulSetStrategyGetter{})
+	if result == rollingUpdateStrategy {
+		return appsv1.StatefulSetUpdateStrategy{
+			Type: appsv1.RollingUpdateStatefulSetStrategyType,
+		}
+	}
+	return appsv1.StatefulSetUpdateStrategy{
+		Type: appsv1.OnDeleteStatefulSetStrategyType,
+	}
+}
+
+func getUpdateStrategy(svc *model.Service, strategy updateStrategyGetter) updateStrategy {
+	if result := getUpdateStrategyByAnnotation(svc); result != "" {
+		err := strategy.validate(result)
+		if err == nil {
+			return result
+		}
+		oktetoLog.Debugf("invalid strategy: %s", err)
+	}
+	if result := getUpdateStrategyByEnvVar(); result != "" {
+		err := strategy.validate(result)
+		if err == nil {
+			return result
+		}
+		oktetoLog.Debugf("invalid strategy: %s", err)
+	}
+	return strategy.getDefault()
+}
+
+func getUpdateStrategyByAnnotation(svc *model.Service) updateStrategy {
+	if v, ok := svc.Annotations[model.OktetoComposeUpdateStrategyAnnotation]; ok {
+		return updateStrategy(v)
+	}
+	return ""
+}
+
+func getUpdateStrategyByEnvVar() updateStrategy {
+	if v := os.Getenv(model.OktetoComposeUpdateStrategyEnvVar); v != "" {
+		return updateStrategy(v)
+	}
+	return ""
 }
